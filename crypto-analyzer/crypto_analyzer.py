@@ -1,7 +1,7 @@
 """
 Crypto Technical Analyzer - Swing Trading Edition
 ==================================================
-OpenBB-alapu kriptovaluta technikai elemzo script.
+OpenBB + Binance kriptovaluta technikai elemzo script.
 
 Funkciok:
   - Tamasz/ellenallas detektalas (Pivot, lokalis extremumok, klaszterek)
@@ -10,11 +10,17 @@ Funkciok:
   - Swing Score (0-100) osszefoglalo pontozas
   - Multi-coin scanner
   - Riasztasok
+  - Binance adatforras (publikus API, nincs API key szukseg)
+  - Binance scanner (top 50 USDT par)
 
 Hasznalat:
     python crypto_analyzer.py
     python crypto_analyzer.py --symbol ETH-USD --days 180
-    python crypto_analyzer.py --symbols BTC-USD,ETH-USD,SOL-USD --days 180
+    python crypto_analyzer.py --symbols BTC-USD,ETH-USD,SOL-USD
+    python crypto_analyzer.py --source binance --symbol BTCUSDT
+    python crypto_analyzer.py --source binance --symbols BTCUSDT,ETHUSDT,SOLUSDT
+    python crypto_analyzer.py --source binance --symbol BTC-USD --interval 4h
+    python crypto_analyzer.py --source binance --scan-binance --days 180
 """
 
 import argparse
@@ -25,18 +31,158 @@ import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
+import requests
 from scipy.signal import argrelextrema
-from openbb import obb
+
+BINANCE_BASE_URL = "https://api.binance.us/api/v3"
 
 
 # ============================================================================
 # 1. ADATLEKERDEZES
 # ============================================================================
+def _symbol_to_binance(symbol: str, quote: str = "USDT") -> str:
+    """BTC-USD -> BTCUSDT, ETHUSDT marad ETHUSDT."""
+    s = symbol.upper().replace("/", "").replace(" ", "")
+    for suffix in ["-USD", "-USDT", "-BUSD", "-BTC", "-ETH"]:
+        if s.endswith(suffix):
+            base = s[: -len(suffix)]
+            return base + quote
+    if not any(s.endswith(q) for q in ["USDT", "BUSD", "BTC", "ETH"]):
+        return s + quote
+    return s
+
+
+def _binance_display_name(binance_sym: str) -> str:
+    """BTCUSDT -> BTC/USDT."""
+    for q in ["USDT", "BUSD", "BTC", "ETH"]:
+        if binance_sym.endswith(q):
+            return binance_sym[: -len(q)] + "/" + q
+    return binance_sym
+
+
+def _binance_interval_ms(interval: str) -> int:
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+    num = int(interval[:-1])
+    return num * units.get(interval[-1], 86_400_000)
+
+
+def fetch_binance_data(
+    symbol: str, days: int = 180, interval: str = "1d", quote: str = "USDT",
+) -> pd.DataFrame:
+    """Binance publikus klines API-ról OHLCV adat lekerese."""
+    bn_symbol = _symbol_to_binance(symbol, quote)
+    display = _binance_display_name(bn_symbol)
+    print(f"  Adatok lekerese (Binance): {display} ({interval}, {days} nap)")
+
+    end_ms = int(datetime.now().timestamp() * 1000)
+    start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    all_rows = []
+    current_start = start_ms
+    limit = 1000
+
+    while current_start < end_ms:
+        params = {
+            "symbol": bn_symbol, "interval": interval,
+            "startTime": current_start, "endTime": end_ms, "limit": limit,
+        }
+        resp = requests.get(f"{BINANCE_BASE_URL}/klines", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+        all_rows.extend(data)
+        last_close_time = data[-1][6]
+        current_start = last_close_time + 1
+        if len(data) < limit:
+            break
+
+    if not all_rows:
+        raise ValueError(f"Nincs adat: {bn_symbol}")
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_vol",
+        "taker_buy_quote_vol", "ignore",
+    ])
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df = df.set_index("date")[["open", "high", "low", "close", "volume"]]
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def fetch_binance_ticker_24h(symbol: str, quote: str = "USDT") -> dict:
+    """24h ticker statisztikak (volume, change, bid/ask)."""
+    bn = _symbol_to_binance(symbol, quote)
+    resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr",
+                        params={"symbol": bn}, timeout=10)
+    resp.raise_for_status()
+    d = resp.json()
+    return {
+        "symbol": bn,
+        "display": _binance_display_name(bn),
+        "price": float(d.get("lastPrice", 0)),
+        "change_pct": float(d.get("priceChangePercent", 0)),
+        "high_24h": float(d.get("highPrice", 0)),
+        "low_24h": float(d.get("lowPrice", 0)),
+        "volume_24h": float(d.get("volume", 0)),
+        "quote_volume_24h": float(d.get("quoteVolume", 0)),
+        "bid": float(d.get("bidPrice", 0)),
+        "ask": float(d.get("askPrice", 0)),
+        "trades_24h": int(d.get("count", 0)),
+    }
+
+
+def fetch_binance_funding_rate(symbol: str, quote: str = "USDT") -> float | None:
+    """Funding rate lekeres futures parhoz (ha elerheto)."""
+    bn = _symbol_to_binance(symbol, quote)
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": bn}, timeout=10,
+        )
+        if resp.status_code == 200:
+            d = resp.json()
+            return float(d.get("lastFundingRate", 0))
+    except Exception:
+        pass
+    return None
+
+
+def scan_binance_top_pairs(
+    quote: str = "USDT", min_volume_usd: float = 1_000_000,
+) -> list[str]:
+    """Top 50 USDT par lekerese Binance-ról, volume alapjan szurve."""
+    resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=15)
+    resp.raise_for_status()
+    tickers = resp.json()
+    usdt_pairs = []
+    for t in tickers:
+        sym = t["symbol"]
+        if not sym.endswith(quote):
+            continue
+        qv = float(t.get("quoteVolume", 0))
+        if qv < min_volume_usd:
+            continue
+        usdt_pairs.append((sym, qv))
+    usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+    return [p[0] for p in usdt_pairs[:50]]
+
+
 def fetch_crypto_data(
     symbol: str = "BTC-USD",
     days: int = 180,
+    source: str = "openbb",
     provider: str = "yfinance",
+    interval: str = "1d",
+    quote: str = "USDT",
 ) -> pd.DataFrame:
+    """Adatlekerdezes source-tol fuggoen."""
+    if source == "binance":
+        return fetch_binance_data(symbol, days, interval, quote)
+    # OpenBB
+    from openbb import obb
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     print(f"  Adatok lekerese: {symbol} ({start_date} -> {end_date})")
@@ -100,20 +246,17 @@ def calc_pivot_points(df: pd.DataFrame) -> dict:
     h, l, c = last["high"], last["low"], last["close"]
     pp = (h + l + c) / 3.0
     levels = {"PP": pp}
-    # Klasszikus
     levels["S1"] = 2 * pp - h
     levels["R1"] = 2 * pp - l
     levels["S2"] = pp - (h - l)
     levels["R2"] = pp + (h - l)
     levels["S3"] = l - 2 * (h - pp)
     levels["R3"] = h + 2 * (pp - l)
-    # Fibonacci
     diff = h - l
     levels["Fib_S1"] = pp - 0.382 * diff
     levels["Fib_S2"] = pp - 0.618 * diff
     levels["Fib_R1"] = pp + 0.382 * diff
     levels["Fib_R2"] = pp + 0.618 * diff
-    # Camarilla
     levels["Cam_S1"] = c - diff * 1.1 / 12
     levels["Cam_R1"] = c + diff * 1.1 / 12
     levels["Cam_S2"] = c - diff * 1.1 / 6
@@ -127,11 +270,7 @@ def detect_local_extrema(df: pd.DataFrame, order: int = 10) -> list:
     close = df["close"].values
     local_max_idx = argrelextrema(close, np.greater_equal, order=order)[0]
     local_min_idx = argrelextrema(close, np.less_equal, order=order)[0]
-    levels = []
-    for i in local_max_idx:
-        levels.append(close[i])
-    for i in local_min_idx:
-        levels.append(close[i])
+    levels = [close[i] for i in local_max_idx] + [close[i] for i in local_min_idx]
     return levels
 
 
@@ -164,8 +303,7 @@ def get_sr_levels(df: pd.DataFrame) -> list:
 # 4. VOLUMEN ELEMZES
 # ============================================================================
 def calc_obv(df: pd.DataFrame) -> pd.Series:
-    obv = (np.sign(df["close"].diff()) * df["volume"].fillna(0)).cumsum()
-    return obv
+    return (np.sign(df["close"].diff()) * df["volume"].fillna(0)).cumsum()
 
 
 def calc_vwap(df: pd.DataFrame) -> pd.Series:
@@ -178,8 +316,7 @@ def calc_vwap(df: pd.DataFrame) -> pd.Series:
 def calc_ad_line(df: pd.DataFrame) -> pd.Series:
     high, low, close, vol = df["high"], df["low"], df["close"], df["volume"].fillna(0)
     mfm = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
-    mfm = mfm.fillna(0)
-    return (mfm * vol).cumsum()
+    return (mfm.fillna(0) * vol).cumsum()
 
 
 def calc_volume_profile(df: pd.DataFrame, bins: int = 30) -> pd.DataFrame:
@@ -193,7 +330,7 @@ def calc_volume_profile(df: pd.DataFrame, bins: int = 30) -> pd.DataFrame:
     return pd.DataFrame({"price": centers, "volume": vol_per_bin})
 
 
-def detect_volume_anomaly(df: pd.DataFrame, window: int = 20, multiplier: float = 2.0) -> bool:
+def detect_volume_anomaly(df: pd.DataFrame, window=20, multiplier=2.0) -> bool:
     vol = df["volume"].fillna(0)
     if len(vol) < window + 1:
         return False
@@ -228,30 +365,23 @@ def calc_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
     kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
     senkou_a = ((tenkan + kijun) / 2).shift(26)
     senkou_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
-    chikou = df["close"].shift(-26)
     return pd.DataFrame({
         "tenkan": tenkan, "kijun": kijun,
-        "senkou_a": senkou_a, "senkou_b": senkou_b, "chikou": chikou,
+        "senkou_a": senkou_a, "senkou_b": senkou_b,
     })
 
 
 def calc_fibonacci_retracement(df: pd.DataFrame) -> dict:
-    close = df["close"]
-    swing_high = close.max()
-    swing_low = close.min()
+    swing_high, swing_low = df["close"].max(), df["close"].min()
     diff = swing_high - swing_low
-    ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-    levels = {}
-    for r in ratios:
-        levels[f"Fib_{r:.1%}"] = swing_high - r * diff
-    return levels
+    return {f"Fib_{r:.1%}": swing_high - r * diff
+            for r in [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]}
 
 
 def detect_golden_death_cross(df: pd.DataFrame) -> str:
     if len(df) < 201:
         return "N/A"
-    sma50 = df["sma_50"]
-    sma200 = df["sma_200"]
+    sma50, sma200 = df["sma_50"], df["sma_200"]
     if sma50.iloc[-1] > sma200.iloc[-1] and sma50.iloc[-2] <= sma200.iloc[-2]:
         return "GOLDEN CROSS"
     if sma50.iloc[-1] < sma200.iloc[-1] and sma50.iloc[-2] >= sma200.iloc[-2]:
@@ -266,57 +396,43 @@ def detect_golden_death_cross(df: pd.DataFrame) -> str:
 # ============================================================================
 def calc_swing_score(df: pd.DataFrame, sr_levels: list) -> tuple:
     last = df.iloc[-1]
-    score = 50.0  # start neutral
-
-    # --- Trend (ADX) ---  max +/-20
+    score = 50.0
     adx_val = last.get("adx", 0)
     plus_di = last.get("plus_di", 0)
     minus_di = last.get("minus_di", 0)
     if adx_val > 25:
-        trend_strength = min(adx_val, 50) / 50 * 20
-        score += trend_strength if plus_di > minus_di else -trend_strength
-    # --- RSI ---  max +/-15
+        ts = min(adx_val, 50) / 50 * 20
+        score += ts if plus_di > minus_di else -ts
     rsi_val = last.get("rsi", 50)
     if rsi_val < 30:
         score += 15 * (30 - rsi_val) / 30
     elif rsi_val > 70:
         score -= 15 * (rsi_val - 70) / 30
-    # --- MACD ---  max +/-15
     macd_val = last.get("macd", 0)
     macd_sig = last.get("macd_signal", 0)
-    if macd_val > macd_sig:
-        score += min(15, 15 * abs(macd_val - macd_sig) / (abs(macd_sig) + 1e-9))
-    else:
-        score -= min(15, 15 * abs(macd_val - macd_sig) / (abs(macd_sig) + 1e-9))
-    # --- Volume trend ---  max +/-10
+    diff = abs(macd_val - macd_sig)
+    contribution = min(15, 15 * diff / (abs(macd_sig) + 1e-9))
+    score += contribution if macd_val > macd_sig else -contribution
     vol = df["volume"].fillna(0)
     if len(vol) >= 21:
-        vol_ratio = vol.iloc[-1] / vol.iloc[-21:-1].mean() if vol.iloc[-21:-1].mean() > 0 else 1
-        if vol_ratio > 1.5:
-            score += 10 * min(vol_ratio - 1, 1)
-        elif vol_ratio < 0.5:
+        avg = vol.iloc[-21:-1].mean()
+        vr = vol.iloc[-1] / avg if avg > 0 else 1
+        if vr > 1.5:
+            score += 10 * min(vr - 1, 1)
+        elif vr < 0.5:
             score -= 5
-    # --- S/R kozelség ---  max +/-10
     close = last["close"]
     if sr_levels:
-        nearest_support = max([l for l in sr_levels if l <= close], default=None)
-        nearest_resist = min([l for l in sr_levels if l > close], default=None)
-        if nearest_support and (close - nearest_support) / close < 0.02:
-            score += 10  # kozel a tamaszhoz -> potencialis pattanas
-        if nearest_resist and (nearest_resist - close) / close < 0.02:
-            score -= 10  # kozel az ellenallashoz
-
+        ns = max([l for l in sr_levels if l <= close], default=None)
+        nr = min([l for l in sr_levels if l > close], default=None)
+        if ns and (close - ns) / close < 0.02:
+            score += 10
+        if nr and (nr - close) / close < 0.02:
+            score -= 10
     score = max(0, min(100, score))
-    if score >= 80:
-        rec = "Eros vetel"
-    elif score >= 60:
-        rec = "Gyenge vetel"
-    elif score >= 40:
-        rec = "Semleges"
-    elif score >= 20:
-        rec = "Gyenge eladas"
-    else:
-        rec = "Eros eladas"
+    labels = [(80, "Eros vetel"), (60, "Gyenge vetel"), (40, "Semleges"),
+              (20, "Gyenge eladas"), (0, "Eros eladas")]
+    rec = next(lb for th, lb in labels if score >= th)
     return round(score, 1), rec
 
 
@@ -327,41 +443,30 @@ def generate_alerts(df: pd.DataFrame, sr_levels: list) -> list:
     alerts = []
     last = df.iloc[-1]
     close = last["close"]
-
-    # RSI
     rsi = last.get("rsi", 50)
     if rsi > 80:
         alerts.append(f"RSI TULVETT ({rsi:.1f}) - Extrem zona!")
     elif rsi < 20:
         alerts.append(f"RSI TULELADOTT ({rsi:.1f}) - Extrem zona!")
-
-    # MACD crossover
     if len(df) >= 2:
         prev = df.iloc[-2]
         if last["macd"] > last["macd_signal"] and prev["macd"] <= prev["macd_signal"]:
             alerts.append("MACD BULLISH CROSSOVER - Veteli jelzes!")
         elif last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
             alerts.append("MACD BEARISH CROSSOVER - Eladasi jelzes!")
-
-    # Golden/Death cross
     cross = detect_golden_death_cross(df)
     if "GOLDEN CROSS" in cross:
         alerts.append("GOLDEN CROSS (SMA50 x SMA200) - Hosszu tavu veteli jelzes!")
     elif "DEATH CROSS" in cross:
         alerts.append("DEATH CROSS (SMA50 x SMA200) - Hosszu tavu eladasi jelzes!")
-
-    # S/R kozelség
     for lvl in sr_levels:
         pct = abs(close - lvl) / close
-        if pct < 0.02 and pct > 0.001:
+        if 0.001 < pct < 0.02:
             tag = "TAMASZ" if lvl < close else "ELLENALLAS"
-            alerts.append(f"{tag} szint kozel: ${lvl:,.0f} ({pct:.1%} tavolsag)")
-
-    # Volume spike
+            alerts.append(f"{tag} szint kozel: ${lvl:,.4g} ({pct:.1%} tavolsag)")
     if detect_volume_anomaly(df):
-        vol_ratio = df["volume"].iloc[-1] / df["volume"].iloc[-21:-1].mean()
-        alerts.append(f"VOLUME SPIKE ({vol_ratio:.1f}x atlag) - Whale gyanu!")
-
+        vr = df["volume"].iloc[-1] / df["volume"].iloc[-21:-1].mean()
+        alerts.append(f"VOLUME SPIKE ({vr:.1f}x atlag) - Whale gyanu!")
     return alerts
 
 
@@ -369,37 +474,22 @@ def generate_alerts(df: pd.DataFrame, sr_levels: list) -> list:
 # 8. OSSZES INDIKATOR HOZZAADASA
 # ============================================================================
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # SMA
     df["sma_20"] = calc_sma(df["close"], 20)
     df["sma_50"] = calc_sma(df["close"], 50)
     df["sma_200"] = calc_sma(df["close"], 200)
-    # RSI
     df["rsi"] = calc_rsi(df)
-    # MACD
     macd = calc_macd(df)
-    df["macd"] = macd["macd"]
-    df["macd_signal"] = macd["signal"]
-    df["macd_hist"] = macd["histogram"]
-    # Bollinger
+    df["macd"], df["macd_signal"], df["macd_hist"] = macd["macd"], macd["signal"], macd["histogram"]
     bb = calc_bollinger(df)
-    df["bb_upper"] = bb["bb_upper"]
-    df["bb_middle"] = bb["bb_middle"]
-    df["bb_lower"] = bb["bb_lower"]
-    # Volume
+    df["bb_upper"], df["bb_middle"], df["bb_lower"] = bb["bb_upper"], bb["bb_middle"], bb["bb_lower"]
     df["obv"] = calc_obv(df)
     df["vwap"] = calc_vwap(df)
     df["ad_line"] = calc_ad_line(df)
-    # ADX
     adx = calc_adx(df)
-    df["adx"] = adx["adx"]
-    df["plus_di"] = adx["plus_di"]
-    df["minus_di"] = adx["minus_di"]
-    # Ichimoku
+    df["adx"], df["plus_di"], df["minus_di"] = adx["adx"], adx["plus_di"], adx["minus_di"]
     ichi = calc_ichimoku(df)
-    df["tenkan"] = ichi["tenkan"]
-    df["kijun"] = ichi["kijun"]
-    df["senkou_a"] = ichi["senkou_a"]
-    df["senkou_b"] = ichi["senkou_b"]
+    df["tenkan"], df["kijun"] = ichi["tenkan"], ichi["kijun"]
+    df["senkou_a"], df["senkou_b"] = ichi["senkou_a"], ichi["senkou_b"]
     return df
 
 
@@ -412,29 +502,24 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
     gs = gridspec.GridSpec(6, 1, height_ratios=[4, 1.5, 1, 1, 1, 1], hspace=0.30)
     dates = df.index
 
-    # --- Panel 1: Ar + BB + SMA + S/R + Ichimoku Cloud ---
+    # --- Panel 1: Ar + BB + SMA + S/R + Ichimoku ---
     ax1 = fig.add_subplot(gs[0])
     ax1.plot(dates, df["close"], lw=1.3, color="#1f77b4", label="Zaroar", zorder=5)
     ax1.plot(dates, df["sma_20"], lw=0.8, ls="--", color="#ff7f0e", label="SMA 20")
     ax1.plot(dates, df["sma_50"], lw=0.8, ls="--", color="#2ca02c", label="SMA 50")
     if df["sma_200"].notna().any():
         ax1.plot(dates, df["sma_200"], lw=0.8, ls="--", color="#d62728", label="SMA 200")
-    # Bollinger
     ax1.fill_between(dates, df["bb_upper"], df["bb_lower"], alpha=0.08, color="blue", label="Bollinger")
     ax1.plot(dates, df["bb_upper"], lw=0.4, color="blue", alpha=0.4)
     ax1.plot(dates, df["bb_lower"], lw=0.4, color="blue", alpha=0.4)
-    # Ichimoku Cloud
-    sa = df["senkou_a"]
-    sb = df["senkou_b"]
+    sa, sb = df["senkou_a"], df["senkou_b"]
     ax1.fill_between(dates, sa, sb, where=sa >= sb, alpha=0.10, color="green", label="Ichimoku (bull)")
     ax1.fill_between(dates, sa, sb, where=sa < sb, alpha=0.10, color="red", label="Ichimoku (bear)")
-    # S/R levels
     price_range = df["close"].max() - df["close"].min()
     for lvl in sr_levels:
         if df["close"].min() - price_range * 0.1 < lvl < df["close"].max() + price_range * 0.1:
             ax1.axhline(lvl, lw=0.7, ls=":", color="#e91e63", alpha=0.6)
-            ax1.text(dates[-1], lvl, f" ${lvl:,.0f}", fontsize=6, color="#e91e63",
-                     va="center", ha="left")
+            ax1.text(dates[-1], lvl, f" ${lvl:,.4g}", fontsize=6, color="#e91e63", va="center", ha="left")
     ax1.set_xlim(dates[0], dates[-1])
     ax1.set_ylabel("Arfolyam (USD)")
     ax1.legend(loc="upper left", fontsize=7, ncol=3)
@@ -443,20 +528,17 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
 
     # --- Panel 2: Volume + Volume Profile ---
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    vol_colors = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(df["close"], df["open"])]
-    ax2.bar(dates, df["volume"].fillna(0).astype(float), color=vol_colors, alpha=0.7, width=0.8)
-    # Whale alert sav
+    vc = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(df["close"], df["open"])]
+    ax2.bar(dates, df["volume"].fillna(0).astype(float), color=vc, alpha=0.7, width=0.8)
     avg_vol = df["volume"].fillna(0).rolling(20).mean()
     ax2.plot(dates, avg_vol * 2, lw=0.7, ls="--", color="purple", alpha=0.5, label="2x atlag (whale)")
-    # Volume Profile jobb oldalra (normalizalt)
     vp = calc_volume_profile(df, bins=25)
     ax2_vp = ax2.twinx()
     max_vp = vp["volume"].max()
     if max_vp > 0:
-        vp_normalized = vp["volume"] / max_vp
-        price_bin_height = (vp["price"].iloc[1] - vp["price"].iloc[0]) if len(vp) > 1 else 1
-        ax2_vp.barh(vp["price"], vp_normalized, height=price_bin_height * 0.9,
-                     alpha=0.15, color="blue")
+        vp_n = vp["volume"] / max_vp
+        pbh = (vp["price"].iloc[1] - vp["price"].iloc[0]) if len(vp) > 1 else 1
+        ax2_vp.barh(vp["price"], vp_n, height=pbh * 0.9, alpha=0.15, color="blue")
     ax2_vp.set_ylim(df["close"].min() * 0.95, df["close"].max() * 1.05)
     ax2_vp.set_yticks([])
     ax2_vp.set_ylabel("Vol.Profile", fontsize=7)
@@ -482,8 +564,8 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
     ax4 = fig.add_subplot(gs[3], sharex=ax1)
     ax4.plot(dates, df["macd"], lw=1, color="#1f77b4", label="MACD")
     ax4.plot(dates, df["macd_signal"], lw=1, color="#ff7f0e", label="Szignal")
-    hist_c = ["#26a69a" if v >= 0 else "#ef5350" for v in df["macd_hist"]]
-    ax4.bar(dates, df["macd_hist"], color=hist_c, alpha=0.5, width=0.8)
+    hc = ["#26a69a" if v >= 0 else "#ef5350" for v in df["macd_hist"]]
+    ax4.bar(dates, df["macd_hist"], color=hc, alpha=0.5, width=0.8)
     ax4.axhline(0, lw=0.5, color="black", alpha=0.3)
     ax4.set_ylabel("MACD")
     ax4.legend(loc="upper left", fontsize=7)
@@ -497,9 +579,9 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
     ax5_ad = ax5.twinx()
     ax5_ad.plot(dates, df["ad_line"], lw=1, color="#e65100", label="A/D Line")
     ax5_ad.set_ylabel("A/D", color="#e65100", fontsize=8)
-    lines1, labels1 = ax5.get_legend_handles_labels()
-    lines2, labels2 = ax5_ad.get_legend_handles_labels()
-    ax5.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
+    l1, lb1 = ax5.get_legend_handles_labels()
+    l2, lb2 = ax5_ad.get_legend_handles_labels()
+    ax5.legend(l1 + l2, lb1 + lb2, loc="upper left", fontsize=7)
     ax5.grid(True, alpha=0.3)
     ax5.set_title("OBV + Accumulation/Distribution")
 
@@ -519,7 +601,7 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
     ax6.xaxis.set_major_locator(mdates.AutoDateLocator())
     plt.setp(ax6.get_xticklabels(), rotation=45, ha="right")
 
-    fname = f"{symbol.replace('/', '-')}_swing_analysis.png"
+    fname = f"{symbol.replace('/', '-').replace(' ', '')}_swing_analysis.png"
     plt.savefig(fname, dpi=150, bbox_inches="tight")
     print(f"  Chart elmentve: {fname}")
     plt.close(fig)
@@ -528,7 +610,8 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
 # ============================================================================
 # 10. SZOVEGES OSSZEFOGLALO
 # ============================================================================
-def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list) -> dict:
+def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
+                  binance_extra: dict | None = None) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
     score, rec = calc_swing_score(df, sr_levels)
@@ -538,31 +621,45 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list) -> dict:
     print("\n" + "=" * 70)
     print(f"  {symbol} — Swing Trading Osszefoglalo")
     print("=" * 70)
-    print(f"  Datum:              {df.index[-1].strftime('%Y-%m-%d')}")
-    print(f"  Zaroar:             ${last['close']:,.2f}")
+    print(f"  Datum:              {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Zaroar:             ${last['close']:,.4g}")
     chg = ((last['close'] / prev['close']) - 1) * 100
     print(f"  Valtozas (1 nap):   {chg:+.2f}%")
+
+    if binance_extra:
+        print("-" * 70)
+        print(f"  Binance 24h adatok:")
+        print(f"    24h High/Low:     ${binance_extra['high_24h']:,.4g} / ${binance_extra['low_24h']:,.4g}")
+        print(f"    24h Volume:       {binance_extra['volume_24h']:,.2f} (${binance_extra['quote_volume_24h']:,.0f})")
+        print(f"    24h Change:       {binance_extra['change_pct']:+.2f}%")
+        print(f"    Bid/Ask:          ${binance_extra['bid']:,.4g} / ${binance_extra['ask']:,.4g}")
+        spread = binance_extra['ask'] - binance_extra['bid']
+        spread_pct = spread / binance_extra['ask'] * 100 if binance_extra['ask'] > 0 else 0
+        print(f"    Spread:           ${spread:,.4g} ({spread_pct:.4f}%)")
+        print(f"    Trades 24h:       {binance_extra['trades_24h']:,}")
+        if binance_extra.get("funding_rate") is not None:
+            print(f"    Funding Rate:     {binance_extra['funding_rate'] * 100:.4f}%")
+
     print("-" * 70)
-    print(f"  SMA 20/50/200:      ${last['sma_20']:,.2f} / ${last['sma_50']:,.2f}", end="")
+    print(f"  SMA 20/50/200:      ${last['sma_20']:,.4g} / ${last['sma_50']:,.4g}", end="")
     if pd.notna(last["sma_200"]):
-        print(f" / ${last['sma_200']:,.2f}")
+        print(f" / ${last['sma_200']:,.4g}")
     else:
         print(" / N/A")
-    print(f"  Bollinger:          ${last['bb_lower']:,.2f} - ${last['bb_upper']:,.2f}")
+    print(f"  Bollinger:          ${last['bb_lower']:,.4g} - ${last['bb_upper']:,.4g}")
     bb_pct = (last["close"] - last["bb_lower"]) / (last["bb_upper"] - last["bb_lower"])
     print(f"  BB %B:              {bb_pct:.1%}")
     print("-" * 70)
     rsi = last["rsi"]
     rsi_tag = " TULVETT!" if rsi > 80 else (" TULELADOTT!" if rsi < 20 else "")
     print(f"  RSI (14):           {rsi:.1f}{rsi_tag}")
-    print(f"  MACD / Szignal:     {last['macd']:.2f} / {last['macd_signal']:.2f}")
+    print(f"  MACD / Szignal:     {last['macd']:.4g} / {last['macd_signal']:.4g}")
     print(f"  ADX:                {last['adx']:.1f}  (+DI: {last['plus_di']:.1f}  -DI: {last['minus_di']:.1f})")
     print(f"  SMA Cross:          {cross}")
-    print(f"  VWAP:               ${last['vwap']:,.2f}")
+    print(f"  VWAP:               ${last['vwap']:,.4g}")
     print("-" * 70)
     print(f"  SWING SCORE:        {score}/100  ->  {rec}")
     print("-" * 70)
-
     if alerts:
         print("  RIASZTASOK:")
         for a in alerts:
@@ -581,14 +678,23 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list) -> dict:
 # ============================================================================
 # 11. MULTI-COIN SCANNER
 # ============================================================================
-def run_scanner(symbols: list, days: int, provider: str) -> None:
+def run_scanner(symbols: list, days: int, source: str, provider: str,
+                interval: str, quote: str) -> None:
     results = []
     for sym in symbols:
         try:
-            df = fetch_crypto_data(symbol=sym, days=days, provider=provider)
+            df = fetch_crypto_data(sym, days, source, provider, interval, quote)
             df = add_all_indicators(df)
             sr = get_sr_levels(df)
-            info = print_summary(df, sym, sr)
+            # Binance extra adatok
+            binance_extra = None
+            if source == "binance":
+                try:
+                    binance_extra = fetch_binance_ticker_24h(sym, quote)
+                    binance_extra["funding_rate"] = fetch_binance_funding_rate(sym, quote)
+                except Exception:
+                    pass
+            info = print_summary(df, sym, sr, binance_extra)
             plot_chart(df, sym, sr)
             results.append(info)
         except Exception as e:
@@ -599,17 +705,17 @@ def run_scanner(symbols: list, days: int, provider: str) -> None:
         print("\n\n" + "=" * 90)
         print("  MULTI-COIN SCANNER OSSZEFOGLALO (rendezve swing score szerint)")
         print("=" * 90)
-        header = f"  {'Coin':<12}{'Ar':>12}{'Valt%':>8}{'RSI':>7}{'ADX':>7}{'MACD':>10}{'Score':>8}{'Jelzes':<16}{'Alert':>6}"
-        print(header)
+        hdr = f"  {'Coin':<14}{'Ar':>14}{'Valt%':>8}{'RSI':>7}{'ADX':>7}{'MACD':>12}{'Score':>8}  {'Jelzes':<14}{'Alert':>6}"
+        print(hdr)
         print("-" * 90)
         for r in results:
             print(
-                f"  {r['symbol']:<12}"
-                f"${r['close']:>10,.2f}"
+                f"  {r['symbol']:<14}"
+                f"${r['close']:>12,.4g}"
                 f"{r['change_pct']:>+7.2f}%"
                 f"{r['rsi']:>7.1f}"
                 f"{r['adx']:>7.1f}"
-                f"{r['macd']:>+10.2f}"
+                f"{r['macd']:>+12.4g}"
                 f"{r['score']:>7.1f}"
                 f"  {r['rec']:<14}"
                 f"{r['alerts']:>4}"
@@ -617,34 +723,67 @@ def run_scanner(symbols: list, days: int, provider: str) -> None:
         print("=" * 90)
 
 
+def run_binance_scan(days: int, interval: str, quote: str,
+                     min_volume: float) -> None:
+    """Binance top 50 par scan es elemzes."""
+    print(f"\n  Binance Scanner: top 50 {quote} par lekerese (min vol: ${min_volume:,.0f})...")
+    top_symbols = scan_binance_top_pairs(quote, min_volume)
+    print(f"  Talalt parok: {len(top_symbols)}\n")
+    if not top_symbols:
+        print("  Nincs elegendo par a szuresnek megfelelo.")
+        return
+    run_scanner(top_symbols, days, "binance", "yfinance", interval, quote)
+
+
 # ============================================================================
 # 12. FOPROGRAM
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Crypto Swing Trading Analyzer (OpenBB)")
+        description="Crypto Swing Trading Analyzer (OpenBB + Binance)")
     parser.add_argument("--symbol", default=None,
-                        help="Egyetlen kriptopar (pl. BTC-USD)")
+                        help="Egyetlen kriptopar (pl. BTC-USD vagy BTCUSDT)")
     parser.add_argument("--symbols", default=None,
-                        help="Tobb coin vesszoval: BTC-USD,ETH-USD,SOL-USD")
+                        help="Tobb coin vesszoval: BTC-USD,ETH-USD vagy BTCUSDT,ETHUSDT")
     parser.add_argument("--days", type=int, default=180,
                         help="Visszatekintesi idoszak napokban (alapert: 180)")
+    parser.add_argument("--source", default="openbb", choices=["openbb", "binance"],
+                        help="Adatforras: openbb (default) vagy binance")
     parser.add_argument("--provider", default="yfinance",
-                        help="Adatforras (yfinance, fmp, tiingo)")
+                        help="OpenBB provider (yfinance, fmp, tiingo)")
+    parser.add_argument("--interval", default="1d",
+                        help="Idointervallum Binance-hoz (1h, 4h, 1d, 1w)")
+    parser.add_argument("--quote", default="USDT",
+                        help="Quote currency Binance-hoz (USDT, BUSD, BTC, ETH)")
+    parser.add_argument("--scan-binance", action="store_true",
+                        help="Binance top 50 USDT par scan")
+    parser.add_argument("--min-volume", type=float, default=1_000_000,
+                        help="Minimum 24h volume USD-ben (scan-binance-hoz)")
     args = parser.parse_args()
+
+    source = args.source
+    if args.scan_binance:
+        source = "binance"
+
+    print(f"\nCrypto Swing Trading Analyzer")
+    print(f"Idoszak: {args.days} nap | Forras: {source}"
+          + (f" | Interval: {args.interval}" if source == "binance" else
+             f" | Provider: {args.provider}"))
+
+    if args.scan_binance:
+        run_binance_scan(args.days, args.interval, args.quote, args.min_volume)
+        return
 
     if args.symbols:
         coin_list = [s.strip() for s in args.symbols.split(",")]
     elif args.symbol:
         coin_list = [args.symbol]
     else:
-        coin_list = ["BTC-USD"]
+        coin_list = ["BTC-USD"] if source == "openbb" else ["BTCUSDT"]
 
-    print(f"\nCrypto Swing Trading Analyzer")
-    print(f"Idoszak: {args.days} nap | Provider: {args.provider}")
     print(f"Coinok: {', '.join(coin_list)}\n")
-
-    run_scanner(coin_list, args.days, args.provider)
+    run_scanner(coin_list, args.days, source, args.provider,
+                args.interval, args.quote)
 
 
 if __name__ == "__main__":
