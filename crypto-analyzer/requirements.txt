@@ -2,3 +2,4 @@ openbb[all]
 matplotlib
 numpy
 pandas
+scipy
