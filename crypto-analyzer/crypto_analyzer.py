@@ -187,7 +187,7 @@ def plot_chart(df: pd.DataFrame, symbol: str) -> None:
     ax4.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
     plt.setp(ax4.get_xticklabels(), rotation=45, ha="right")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    gs.tight_layout(fig, rect=[0, 0, 1, 0.96])
     plt.savefig(f"{symbol.replace('/', '-')}_technical_analysis.png", dpi=150, bbox_inches="tight")
     print(f"Chart elmentve: {symbol.replace('/', '-')}_technical_analysis.png")
     plt.show()
