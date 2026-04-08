@@ -312,8 +312,12 @@ def fetch_binance_funding_rate(symbol: str, quote: str = "USDT") -> float | None
 
 def scan_binance_top_pairs(
     quote: str = "USDT", min_volume_usd: float = 1_000_000,
+    limit: int = 0,
 ) -> list[str]:
-    """Top 50 USDT par lekerese Binance-ról, volume alapjan szurve."""
+    """USDT parok lekerese Binance-ról, volume alapjan szurve.
+    limit=0: osszes par (exchangeInfo-val), limit>0: top N."""
+    # ExchangeInfo a valid szimbolumokhoz
+    valid = _get_valid_usdt_symbols()
     resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=15)
     resp.raise_for_status()
     tickers = resp.json()
@@ -322,8 +326,9 @@ def scan_binance_top_pairs(
         sym = t["symbol"]
         if not sym.endswith(quote):
             continue
+        if valid and sym not in valid:
+            continue
         base = sym[:-len(quote)]
-        # Stablecoin, fiat, leveraged filter
         if base in STABLECOINS or base in FIAT_BASES:
             continue
         if any(sub in base for sub in _BLACKLIST_SUBSTRINGS):
@@ -335,7 +340,9 @@ def scan_binance_top_pairs(
             continue
         usdt_pairs.append((sym, qv))
     usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-    return [p[0] for p in usdt_pairs[:50]]
+    if limit > 0:
+        return [p[0] for p in usdt_pairs[:limit]]
+    return [p[0] for p in usdt_pairs]
 
 
 def fetch_crypto_data(
@@ -1382,10 +1389,12 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
 
 def run_binance_scan(days: int, interval: str, quote: str,
                      min_volume: float, detail_threshold: float = 0,
-                     use_mtf: bool = False) -> None:
-    """Binance top 50 par scan es elemzes."""
-    print(f"\n  Binance Scanner: top 50 {quote} par lekerese (min vol: ${min_volume:,.0f})...")
-    top_symbols = scan_binance_top_pairs(quote, min_volume)
+                     use_mtf: bool = False, scan_all: bool = False) -> None:
+    """Binance par scan es elemzes. scan_all=True: osszes par, nem csak top 50."""
+    limit = 0 if scan_all else 50
+    label = "OSSZES" if scan_all else "top 50"
+    print(f"\n  Binance Scanner: {label} {quote} par lekerese (min vol: ${min_volume:,.0f})...")
+    top_symbols = scan_binance_top_pairs(quote, min_volume, limit=limit)
     print(f"  Talalt parok: {len(top_symbols)}\n")
     if not top_symbols:
         print("  Nincs elegendo par a szuresnek megfelelo.")
@@ -2577,7 +2586,205 @@ def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
 
 
 # ============================================================================
-# 16. FOPROGRAM
+# 16. FULL SCAN (--scan-all)
+# ============================================================================
+def run_full_scan(days: int, interval: str, quote: str,
+                  min_volume: float, min_short_score: float,
+                  use_mtf: bool) -> None:
+    """Teljes scan: long + short, osszes par, top 3+3 reszletes elemzes."""
+    import os, time as _time
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    os.makedirs("results", exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    outfile = f"results/full_scan_{ts}.txt"
+
+    # Redirect print to both stdout and file
+    import io, sys
+    class Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    logf = open(outfile, "w")
+    old_stdout = sys.stdout
+    sys.stdout = Tee(old_stdout, logf)
+
+    try:
+        print(f"\n{B}{'=' * 75}")
+        print(f" FULL CRYPTO SCAN — {ts}")
+        print(f"{'=' * 75}{D}")
+        print(f"  Min volume: ${min_volume:,.0f} | MTF: {'ON' if use_mtf else 'OFF'}")
+        print(f"  Idoszak: {days} nap | Interval: {interval}\n")
+
+        # ---- LONG SCAN ----
+        print(f"{G}{'=' * 75}")
+        print(f" [1/3] LONG SCANNER — OSSZES USDT par")
+        print(f"{'=' * 75}{D}")
+
+        all_symbols = scan_binance_top_pairs(quote, min_volume, limit=0)
+        print(f"  Szurt parok: {len(all_symbols)}\n")
+
+        long_results = []
+        total = len(all_symbols)
+        for idx, sym in enumerate(all_symbols):
+            if (idx + 1) % 10 == 0 or idx == total - 1:
+                pct = (idx + 1) / total * 100
+                print(f"\r  Long scan... {idx+1}/{total} ({pct:.0f}%)   ", end="", flush=True)
+            try:
+                df = fetch_binance_data(sym, days=days, interval=interval,
+                                       quote=quote, quiet=True)
+                if len(df) < 20:
+                    continue
+                df = add_all_indicators(df)
+                sr = get_sr_levels(df)
+                score, rec, raw, pen, pflags = calc_swing_score(df, sr)
+                mtf = None
+                mtf_str = ""
+                if use_mtf:
+                    try:
+                        mtf = calc_mtf(sym, quote)
+                        score = max(0, min(100, score + mtf_score_modifier(mtf)))
+                        mtf_str = f"{mtf['bull_count']}/4"
+                    except Exception:
+                        pass
+                last = df.iloc[-1]
+                chg = ((last["close"] / df.iloc[-2]["close"]) - 1) * 100
+                long_results.append({
+                    "symbol": sym, "close": last["close"], "change_pct": chg,
+                    "rsi": last.get("rsi", 50), "adx": last.get("adx", 0),
+                    "macd": last.get("macd", 0), "score": score,
+                    "raw_score": raw, "penalty": pen,
+                    "rec": rec, "pump_warn": pen >= 20,
+                    "mtf": mtf_str, "mtf_result": mtf,
+                    "df": df, "sr": sr,
+                })
+                _time.sleep(0.1)
+            except Exception:
+                continue
+
+        print(f"\r  Long scan... {total}/{total} (100%) - KESZ!         ")
+
+        long_results.sort(key=lambda x: x["score"], reverse=True)
+        top_long = [r for r in long_results if r["score"] >= 60 and not r["pump_warn"]]
+
+        # Long tabla
+        W2 = 105
+        print(f"\n{'=' * W2}")
+        print(f"  LONG SCANNER OSSZEFOGLALO — TOP 20 (rendezve score szerint)")
+        print(f"{'=' * W2}")
+        hdr = f"  {'#':<4}{'Coin':<14}{'Ar':>14}{'Valt%':>8}{'RSI':>7}{'Score':>8}{'Pen':>5}"
+        if use_mtf:
+            hdr += f"{'MTF':>6}"
+        hdr += f"  {'Jelzes':<14}{'Flag':>6}"
+        print(hdr)
+        print(f"{'-' * W2}")
+        for i, r in enumerate(long_results[:20]):
+            pen = r.get("penalty", 0)
+            pen_str = f"-{pen:.0f}" if pen > 0 else ""
+            flag = "PUMP!" if r.get("pump_warn") else ""
+            line = (
+                f"  {i+1:<4}{r['symbol']:<14}"
+                f"${r['close']:>12,.4g}"
+                f"{r['change_pct']:>+7.2f}%"
+                f"{r['rsi']:>7.1f}"
+                f"{r['score']:>7.1f}"
+                f"{pen_str:>5}"
+            )
+            if use_mtf:
+                line += f"  {r.get('mtf', ''):>4}"
+            line += f"  {r['rec']:<14}{flag:>5}"
+            print(line)
+        print(f"{'=' * W2}")
+        print(f"  Osszes par: {total} | Score >= 60 (nem pump): {len(top_long)}")
+
+        # ---- SHORT SCAN ----
+        print(f"\n{R}{'=' * 75}")
+        print(f" [2/3] SHORT SCANNER — OSSZES USDT par")
+        print(f"{'=' * 75}{D}")
+        run_short_scanner(days, interval, quote, min_volume,
+                          min_short_score, True, use_mtf=use_mtf)
+
+        # ---- TOP 3+3 RESZLETES ----
+        print(f"\n{B}{'=' * 75}")
+        print(f" [3/3] RESZLETES ELEMZES — TOP 3 LONG + TOP 3 SHORT")
+        print(f"{'=' * 75}{D}")
+
+        # Top 3 long
+        for i, r in enumerate(top_long[:3]):
+            sym = r["symbol"]
+            print(f"\n{G}--- LONG #{i+1}: {sym} (Score: {r['score']}) ---{D}")
+            try:
+                bx = None
+                try:
+                    bx = fetch_binance_ticker_24h(sym, quote)
+                    bx["funding_rate"] = fetch_binance_funding_rate(sym, quote)
+                except Exception:
+                    pass
+                print_summary(r["df"], sym, r["sr"], bx,
+                              mtf_result=r.get("mtf_result"))
+                plot_chart(r["df"], sym, r["sr"])
+            except Exception as e:
+                print(f"  HIBA: {e}")
+
+        # Top 3 short — ujra lekerjuk a short scanner eredmenyeit
+        # (a run_short_scanner nem adja vissza, szoval ujrafuttatjuk gyorsan a top 3-at)
+        # Cached adatok vannak, szoval gyors lesz
+        print(f"\n{R}--- TOP 3 SHORT reszletes elemzes ---{D}")
+        # Keressuk meg a 3 legjobb short jeloltet a long_results-bol
+        # ahol a short score magas
+        short_candidates = []
+        for r in long_results:
+            if r["score"] < 50 and not r["pump_warn"]:
+                # Alacsony long score = potencialis short
+                short_candidates.append(r)
+        # Vagy hasznaljuk az MTF bearish jelolteket
+        mtf_short = [r for r in long_results
+                     if r.get("mtf_result") and r["mtf_result"].get("bear_count", 0) >= 3
+                     and not r["pump_warn"]]
+        mtf_short.sort(key=lambda x: x.get("mtf_result", {}).get("bear_count", 0), reverse=True)
+
+        short_top = mtf_short[:3] if mtf_short else short_candidates[:3]
+        for i, r in enumerate(short_top):
+            sym = r["symbol"]
+            bear_c = r.get("mtf_result", {}).get("bear_count", 0) if r.get("mtf_result") else "?"
+            print(f"\n{R}--- SHORT #{i+1}: {sym} (MTF bear: {bear_c}/4) ---{D}")
+            try:
+                bx = None
+                try:
+                    bx = fetch_binance_ticker_24h(sym, quote)
+                except Exception:
+                    pass
+                print_summary(r["df"], sym, r["sr"], bx,
+                              mtf_result=r.get("mtf_result"))
+                plot_chart(r["df"], sym, r["sr"])
+            except Exception as e:
+                print(f"  HIBA: {e}")
+
+        print(f"\n{B}{'=' * 75}")
+        print(f" FULL SCAN VEGE — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"{'=' * 75}{D}")
+
+    finally:
+        sys.stdout = old_stdout
+        logf.close()
+
+    print(f"\n  Eredmeny mentve: {outfile}")
+    print(f"  Meret: {os.path.getsize(outfile) / 1024:.0f} KB")
+
+
+# ============================================================================
+# 17. FOPROGRAM
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -2600,6 +2807,8 @@ def main() -> None:
                         help="Binance top 50 USDT par scan")
     parser.add_argument("--scan-shorts", action="store_true",
                         help="Short opportunity scanner - osszes USDT par")
+    parser.add_argument("--scan-all", action="store_true",
+                        help="TELJES scan: long + short, osszes par, top 3+3 reszletes")
     parser.add_argument("--min-volume", type=float, default=1_000_000,
                         help="Minimum 24h volume USD-ben")
     parser.add_argument("--min-short-score", type=float, default=60,
@@ -2634,7 +2843,7 @@ def main() -> None:
     args = parser.parse_args()
 
     source = args.source
-    if args.scan_binance or args.scan_shorts:
+    if args.scan_binance or args.scan_shorts or args.scan_all:
         source = "binance"
     if args.backtest and source == "openbb":
         source = "binance"
@@ -2643,6 +2852,11 @@ def main() -> None:
     print(f"Idoszak: {args.days} nap | Forras: {source}"
           + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
+
+    if args.scan_all:
+        run_full_scan(args.days, args.interval, args.quote,
+                      args.min_volume, args.min_short_score, args.mtf)
+        return
 
     if args.backtest:
         if args.symbols:
