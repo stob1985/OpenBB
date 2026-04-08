@@ -1144,7 +1144,9 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
 # 11. MULTI-COIN SCANNER
 # ============================================================================
 def run_scanner(symbols: list, days: int, source: str, provider: str,
-                interval: str, quote: str) -> None:
+                interval: str, quote: str,
+                detail_threshold: float = 0) -> None:
+    """detail_threshold: csak ez feletti score-nal ad reszletes elemzest + chartot."""
     results = []
     for sym in symbols:
         try:
@@ -1164,6 +1166,19 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                     binance_extra = fetch_alpha_ticker(sym)
                 except Exception:
                     pass
+            # Ellenorizzuk a score-t elore
+            score, _ = calc_swing_score(df, sr)
+            if detail_threshold > 0 and score < detail_threshold:
+                # Csak tablazatba kerul, nincs reszletes elemzes
+                last = df.iloc[-1]
+                chg = ((last["close"] / df.iloc[-2]["close"]) - 1) * 100
+                results.append({
+                    "symbol": sym, "close": last["close"], "change_pct": chg,
+                    "rsi": last.get("rsi", 50), "adx": last.get("adx", 0),
+                    "macd": last.get("macd", 0), "score": score,
+                    "rec": _, "alerts": len(generate_alerts(df, sr)),
+                })
+                continue
             info = print_summary(df, sym, sr, binance_extra)
             plot_chart(df, sym, sr)
             results.append(info)
@@ -1194,7 +1209,7 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
 
 
 def run_binance_scan(days: int, interval: str, quote: str,
-                     min_volume: float) -> None:
+                     min_volume: float, detail_threshold: float = 0) -> None:
     """Binance top 50 par scan es elemzes."""
     print(f"\n  Binance Scanner: top 50 {quote} par lekerese (min vol: ${min_volume:,.0f})...")
     top_symbols = scan_binance_top_pairs(quote, min_volume)
@@ -1202,7 +1217,8 @@ def run_binance_scan(days: int, interval: str, quote: str,
     if not top_symbols:
         print("  Nincs elegendo par a szuresnek megfelelo.")
         return
-    run_scanner(top_symbols, days, "binance", "yfinance", interval, quote)
+    run_scanner(top_symbols, days, "binance", "yfinance", interval, quote,
+                detail_threshold=detail_threshold)
 
 
 # ============================================================================
@@ -1684,6 +1700,8 @@ def main() -> None:
                         help="Minimum short score (0-100, alapert: 60)")
     parser.add_argument("--exclude-stablecoins", action="store_true", default=True,
                         help="Stablecoinok kiszurese (alapert: igen)")
+    parser.add_argument("--detail-threshold", type=float, default=0,
+                        help="Reszletes elemzes csak e score felett (0=mindig)")
     args = parser.parse_args()
 
     source = args.source
@@ -1702,7 +1720,8 @@ def main() -> None:
         return
 
     if args.scan_binance:
-        run_binance_scan(args.days, args.interval, args.quote, args.min_volume)
+        run_binance_scan(args.days, args.interval, args.quote, args.min_volume,
+                         detail_threshold=args.detail_threshold)
         return
 
     if args.symbols:
@@ -1715,7 +1734,8 @@ def main() -> None:
 
     print(f"Coinok: {', '.join(coin_list)}\n")
     run_scanner(coin_list, args.days, source, args.provider,
-                args.interval, args.quote)
+                args.interval, args.quote,
+                detail_threshold=args.detail_threshold)
 
 
 if __name__ == "__main__":
