@@ -39,7 +39,7 @@ from scipy.signal import argrelextrema
 
 colorama_init(autoreset=True)
 
-BINANCE_BASE_URL = "https://api.binance.us/api/v3"
+BINANCE_BASE_URL = "https://data-api.binance.vision/api/v3"
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
 
 # Binance Alpha token cache (lazyload)
@@ -1371,27 +1371,55 @@ def calc_short_score(df: pd.DataFrame, sr_levels: list,
     return min(score, 100), reasons
 
 
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "2L", "2S")
+
+
+def _get_valid_usdt_symbols() -> set[str]:
+    """ExchangeInfo-ból TRADING statuszu USDT parok, kiszurve a leveraged tokeneket."""
+    try:
+        resp = requests.get(f"{BINANCE_BASE_URL}/exchangeInfo", timeout=15)
+        resp.raise_for_status()
+        symbols_info = resp.json().get("symbols", [])
+        valid = set()
+        for s in symbols_info:
+            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                sym = s["symbol"]
+                base = sym[:-4]
+                # Leveraged tokenek kiszurese
+                if any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES):
+                    continue
+                valid.add(sym)
+        return valid
+    except Exception:
+        return set()
+
+
 def _prefilter_short_candidates(tickers: list, min_volume: float,
-                                exclude_stablecoins: bool) -> list[dict]:
-    """Eloszures: 24h change, volume, stablecoin filter."""
+                                exclude_stablecoins: bool,
+                                valid_symbols: set[str] | None = None) -> list[dict]:
+    """Eloszures: exchangeInfo, volume, stablecoin, leveraged token filter."""
     candidates = []
     for t in tickers:
         sym = t["symbol"]
         if not sym.endswith("USDT"):
             continue
+        # ExchangeInfo filter (ha elerheto)
+        if valid_symbols and sym not in valid_symbols:
+            continue
         base = sym[:-4]
         if exclude_stablecoins and base in STABLECOINS:
+            continue
+        # Leveraged token filter (dupla biztonsag)
+        if any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES):
             continue
         qv = float(t.get("quoteVolume", 0))
         if qv < min_volume:
             continue
-        change_pct = float(t.get("priceChangePercent", 0))
-        price = float(t.get("lastPrice", 0))
-        # Pre-filter: valoszinu short jeloltek - mar emelkedtek VAGY magas a change
-        # De mindenkit atnezunk aki megfelel a volumefilternek
         candidates.append({
-            "symbol": sym, "base": base, "price": price,
-            "change_pct": change_pct, "quote_volume": qv,
+            "symbol": sym, "base": base,
+            "price": float(t.get("lastPrice", 0)),
+            "change_pct": float(t.get("priceChangePercent", 0)),
+            "quote_volume": qv,
             "volume_24h": float(t.get("volume", 0)),
             "high_24h": float(t.get("highPrice", 0)),
             "low_24h": float(t.get("lowPrice", 0)),
@@ -1402,8 +1430,9 @@ def _prefilter_short_candidates(tickers: list, min_volume: float,
 def run_short_scanner(days: int, interval: str, quote: str,
                       min_volume: float, min_score: float,
                       exclude_stablecoins: bool) -> None:
-    """Short opportunity scanner - batch lekerdezesekkel."""
+    """Short opportunity scanner - globalis Binance API, batch lekerdezesekkel."""
     global _short_scan_cache, _short_scan_cache_time
+    import time
 
     B = Fore.CYAN + Style.BRIGHT
     R = Fore.RED + Style.BRIGHT
@@ -1418,8 +1447,13 @@ def run_short_scanner(days: int, interval: str, quote: str,
     print(f"  Min volume: ${min_volume:,.0f} | Min score: {min_score}")
     print(f"  Idoszak: {days} nap | Interval: {interval}")
 
-    # 1. Osszes ticker lekerese
-    print(f"\n  Tickers lekerese...", end="", flush=True)
+    # 1. ExchangeInfo - valid szimbolumok
+    print(f"\n  Exchange info lekerese...", end="", flush=True)
+    valid_symbols = _get_valid_usdt_symbols()
+    print(f" {len(valid_symbols)} aktiv USDT par")
+
+    # 2. Osszes ticker lekerese (cached)
+    print(f"  24h tickers lekerese...", end="", flush=True)
     now = datetime.now()
     cache_valid = (_short_scan_cache_time and
                    (now - _short_scan_cache_time).total_seconds() < 300 and
@@ -1436,35 +1470,50 @@ def run_short_scanner(days: int, interval: str, quote: str,
         _short_scan_cache_time = now
         print(f" {len(tickers)} par")
 
-    # 2. Pre-filter
+    # 3. Pre-filter
     candidates = _prefilter_short_candidates(tickers, min_volume,
-                                              exclude_stablecoins)
-    print(f"  Szurt jeloltek (vol > ${min_volume:,.0f}, USDT): {len(candidates)}")
+                                              exclude_stablecoins,
+                                              valid_symbols)
+    print(f"  Szurt jeloltek (vol > ${min_volume:,.0f}, USDT, no leverage): "
+          f"{len(candidates)}")
 
     if not candidates:
         print(f"  {Y}Nincs jelolt a filternek megfelelo.{D}")
         return
 
-    # 3. Mindegyikre technikai elemzes
+    # 4. Mindegyikre technikai elemzes
     results = []
     total = len(candidates)
-    import time
+    errors = 0
+    req_count = 0
+    last_req_time = time.time()
 
     for idx, cand in enumerate(candidates):
         sym = cand["symbol"]
-        # Progress
-        if (idx + 1) % 5 == 0 or idx == total - 1:
-            print(f"\r  Szkenneles... {idx + 1}/{total} par elemezve", end="", flush=True)
+
+        # Progress (minden 10 parnal)
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            pct = (idx + 1) / total * 100
+            print(f"\r  Szkenneles... {idx + 1}/{total} par atvizsgalva ({pct:.0f}%)   ",
+                  end="", flush=True)
 
         try:
+            # Rate limit: max 10 req/sec
+            elapsed = time.time() - last_req_time
+            if elapsed < 0.1:
+                time.sleep(0.1 - elapsed)
+
             df = fetch_binance_data(sym, days=days, interval=interval,
                                    quote=quote, quiet=True)
+            req_count += 1
+            last_req_time = time.time()
+
             if len(df) < 20:
                 continue
             df = add_all_indicators(df)
             sr = get_sr_levels(df)
 
-            # Funding rate (proba)
+            # Funding rate (proba, nem szamit bele a rate limitbe)
             fr = fetch_binance_funding_rate(sym, quote)
 
             short_score, reasons = calc_short_score(df, sr, fr)
@@ -1486,19 +1535,27 @@ def run_short_scanner(days: int, interval: str, quote: str,
                     "funding_rate": fr,
                 })
 
-            # Rate limit: max ~20 req/sec biztonsagosan
-            time.sleep(0.15)
-
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                print(f"\n  {Y}Rate limit! Varakozas 30 mp...{D}", flush=True)
+                time.sleep(30)
+            else:
+                errors += 1
+            continue
         except Exception:
+            errors += 1
             continue
 
-    print(f"\r  Szkenneles... {total}/{total} par elemezve - KESZ!     ")
+    print(f"\r  Szkenneles... {total}/{total} par atvizsgalva (100%) - KESZ!     ")
+    if errors:
+        print(f"  ({errors} par atugorva hiba miatt)")
+    print(f"  Talalatok: {len(results)} par score >= {min_score}")
 
     if not results:
         print(f"\n  {Y}Nincs short jelolt score >= {min_score} felett.{D}")
         return
 
-    # 4. Rangsolas
+    # 5. Rangsolas
     results.sort(key=lambda x: x["short_score"], reverse=True)
     top20 = results[:20]
 
