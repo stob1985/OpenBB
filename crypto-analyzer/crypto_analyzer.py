@@ -1101,6 +1101,322 @@ def _position_size(portfolio: float, close: float, atr: float, stop_dist: float,
     }
 
 
+def _wrap(text: str, width: int = 68, indent: str = "  ") -> str:
+    """Szoveg sorokra tordelese."""
+    words = text.split()
+    lines = []
+    line = indent
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            lines.append(line)
+            line = indent + w
+        else:
+            line += (" " if line.strip() else "") + w
+    if line.strip():
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _build_narrative(df, last, close, rsi, atr, chg, sr_levels, fib, mtf_result,
+                     large_candles, vol_24h) -> str:
+    """Reszletes technikai narrativa generalasa."""
+    parts = []
+    # Arfolyam mozgas
+    n7 = min(8, len(df))
+    week_chg = (close - df["close"].iloc[-n7]) / df["close"].iloc[-n7] * 100
+    n30 = min(31, len(df))
+    month_chg = (close - df["close"].iloc[-n30]) / df["close"].iloc[-n30] * 100
+    high_30 = df["high"].iloc[-n30:].max()
+    low_30 = df["low"].iloc[-n30:].min()
+
+    if week_chg > 5:
+        parts.append(f"Az elmult 7 napban {week_chg:+.1f}%-ot emelkedett.")
+    elif week_chg < -5:
+        parts.append(f"Az elmult 7 napban {week_chg:+.1f}%-ot esett.")
+    else:
+        parts.append(f"Az elmult 7 napban {week_chg:+.1f}% valtozas — oldalazas.")
+
+    parts.append(f"30 napos tartomany: {_P(low_30)} - {_P(high_30)} ({month_chg:+.1f}% honap).")
+
+    # MACD tortenet
+    macd_v = last.get("macd", 0)
+    macd_s = last.get("macd_signal", 0)
+    macd_h = last.get("macd_hist", 0)
+    if len(df) >= 3:
+        prev_h = df["macd_hist"].iloc[-2]
+        if macd_v > macd_s:
+            if prev_h < 0 and macd_h > 0:
+                parts.append("A MACD epp most vegzett bullish crossovert — friss veteli jelzes.")
+            elif macd_h > prev_h:
+                parts.append("A MACD hisztogram egyre magasabban pozitiv — erosodo bullish momentum.")
+            else:
+                parts.append("A MACD bullish, de a hisztogram csokken — a momentum lassul.")
+        else:
+            if prev_h > 0 and macd_h < 0:
+                parts.append("A MACD epp most vegzett bearish crossovert — friss eladasi jelzes.")
+            elif macd_h < prev_h:
+                parts.append("A MACD hisztogram egyre melyebben negativ — gyorsulo bearish momentum.")
+            else:
+                parts.append("A MACD bearish, de a hisztogram emelkedik — az eladoi nyomas csokkenhet.")
+
+    # RSI
+    if rsi > 75:
+        parts.append(f"Az RSI {rsi:.0f} — erosen tulvett zona, korrekcio valoszinu 1-3 napon belul.")
+    elif rsi > 65:
+        parts.append(f"Az RSI {rsi:.0f} — enyhen tulvett, meg van mozgaster felfelé de ovatosan.")
+    elif rsi < 25:
+        parts.append(f"Az RSI {rsi:.0f} — erosen tuleladott, pattanas barmikor johet.")
+    elif rsi < 35:
+        parts.append(f"Az RSI {rsi:.0f} — tuleladott zona kozeleben, a bearish momentum kimerulhet.")
+    else:
+        parts.append(f"Az RSI {rsi:.0f} — semleges tartomanyban, nincs extrem jelzes.")
+
+    # Volume
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 20:
+        avg_5 = vol.iloc[-5:].mean()
+        avg_30 = vol.iloc[-min(30,len(vol)):].mean()
+        if avg_30 > 0:
+            vr = avg_5 / avg_30
+            if vr > 1.5:
+                parts.append(f"A volume az elmult 5 napban {(vr-1)*100:.0f}%-kal MAGASABB mint a 30 napos atlag — novekvo erdeklodes.")
+            elif vr < 0.6:
+                parts.append(f"A volume az elmult 5 napban {(1-vr)*100:.0f}%-kal ALACSONYABB mint a 30 napos atlag — nincs erdeklodes.")
+            else:
+                parts.append("A volume stabil az atlag korul.")
+
+    # MTF
+    if mtf_result:
+        bc = mtf_result.get("bull_count", 0)
+        brc = mtf_result.get("bear_count", 0)
+        sig = mtf_result.get("signal", "")
+        if bc == 4:
+            parts.append("Mind a 4 timeframe (1h, 4h, 1d, 1w) bullish — ez ritka es nagyon eros jelzes.")
+        elif brc == 4:
+            parts.append("Mind a 4 timeframe (1h, 4h, 1d, 1w) bearish — ez ritka es nagyon eros jelzes. Az Ichimoku felho alatt van az ar minden TF-en.")
+        elif "WEAK" in sig:
+            parts.append(f"A timeframe-ek megosztottak ({bc}/4 bull, {brc}/4 bear) — nincs egyertelmu irany, nagyobb kockazat.")
+
+    # Tamasz/ellenallas
+    supports = sorted([l for l in sr_levels if l < close], reverse=True)
+    resists = sorted([l for l in sr_levels if l > close])
+    if supports:
+        parts.append(f"Legkozelebbi tamasz: {_P(supports[0])} ({(close-supports[0])/close*100:.1f}% tavolsag).")
+        if len(supports) > 1:
+            parts.append(f"Ha ezt elveszti, a kovetkezo szint {_P(supports[1])}.")
+    if resists:
+        parts.append(f"Legkozelebbi ellenallas: {_P(resists[0])} ({(resists[0]-close)/close*100:.1f}% tavolsag).")
+
+    # Likviditas
+    if vol_24h > 10_000_000:
+        parts.append(f"A 24h volume ${vol_24h/1e6:.1f}M — kivaloan likvid, nagy poziciok is kezelhetok.")
+    elif vol_24h > 1_000_000:
+        parts.append(f"A 24h volume ${vol_24h/1e6:.1f}M — elfogadhato likviditas.")
+    elif vol_24h > 100_000:
+        parts.append(f"A 24h volume ${vol_24h/1e3:.0f}K — alacsony likviditas, spread figyelese fontos!")
+    else:
+        parts.append(f"A 24h volume ${vol_24h/1e3:.0f}K — NAGYON alacsony, csuszas kockazat!")
+
+    return " ".join(parts)
+
+
+def _build_detailed_scenarios(df, close, sr_levels, atr, adx, rsi, mtf_result, fib) -> str:
+    """Reszletes szcenarió elemzes."""
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    supports = sorted([l for l in sr_levels if l < close], reverse=True)
+    resists = sorted([l for l in sr_levels if l > close])
+    s1 = supports[0] if supports else close - atr * 2
+    s2 = supports[1] if len(supports) > 1 else s1 - atr
+    r1 = resists[0] if resists else close + atr * 2
+    r2 = resists[1] if len(resists) > 1 else r1 + atr
+    sma50 = df.get("sma_50")
+    sma50_v = float(sma50.iloc[-1]) if sma50 is not None and sma50.notna().iloc[-1] else close
+
+    mtf_bull = mtf_result.get("bull_count", 2) if mtf_result else 2
+    bull_prob = 55 if mtf_bull >= 3 else (40 if adx > 25 else 35)
+    bear_prob = 100 - bull_prob - 15
+    neutral_prob = 15
+
+    lines = []
+    lines.append(f"\n  {G}BULLISH SZCENARIÓ ({bull_prob}% esely):{D}")
+    lines.append(_wrap(f"Ha az ar attori a(z) {_P(r1)} ellenallast volumennel, a kovetkezo celszint {_P(r2)}. "
+        f"Ehhez az RSI-nek 50 felett kell maradnia es a MACD-nak bullish-nek. "
+        f"Az SMA50 ({_P(sma50_v)}) fontos kozeptavu tamasz — amig felette van az ar, a long setup ervenyes. "
+        f"{'A 4/4 bullish MTF tamogatja ezt a szcenáriot.' if mtf_bull==4 else 'Az MTF nem teljes megerosites, ovatosan.' if mtf_bull<3 else 'A 3/4 MTF tamogatja a bullish iranyt.'}"))
+
+    lines.append(f"\n  {R}BEARISH SZCENARIÓ ({bear_prob}% esely):{D}")
+    lines.append(_wrap(f"Ha elveszti a(z) {_P(s1)} tamaszt, a kovetkezo support {_P(s2)}, "
+        f"ami {(close-s2)/close*100:.1f}%-os esest jelent. "
+        f"{'A 4/4 bearish MTF erositi ezt a szcenáriot — az eladoi nyomas minden idotavon jelen van.' if mtf_bull==0 else ''} "
+        f"Ha a volume megnovekedik az eses soran, az panik-eladasra utal es gyorsithatja a mozgast. "
+        f"Stop-loss legyen {_P(s1)} kozeleben long, vagy {_P(r1)} kozeleben short pozicionál."))
+
+    lines.append(f"\n  {Y}KONSZOLIDACIOS SZCENARIÓ ({neutral_prob}% esely):{D}")
+    lines.append(_wrap(f"Az ar {_P(s1)} - {_P(r1)} tartomanyban ragad. "
+        f"Ez swing tradinghez a legrosszabb, mert a toke le van kotve mozgas nelkul. "
+        f"Ha {'7' if atr/close > 0.05 else '10'} nap utan nincs elmozdulas, zard a poziciot. "
+        f"Az ATR ({atr/close*100:.1f}%) alapjan naponta atlagosan ennyit mozog az ar."))
+
+    return "\n".join(lines)
+
+
+def _build_detailed_entry(close, sr_levels, atr, rsi, fib, sma20) -> str:
+    """Reszletes belepesi strategia."""
+    G = Fore.GREEN + Style.BRIGHT
+    D = Style.RESET_ALL
+    supports = sorted([l for l in sr_levels if l < close], reverse=True)
+    resists = sorted([l for l in sr_levels if l > close])
+
+    lines = []
+    # a) Azonnali
+    lines.append(f"  a) AZONNALI belepes: {_P(close)}")
+    lines.append(f"     Pro: nem maradsz le ha folytatodik a mozgas")
+    lines.append(f"     Kontra: nincs megerosites, kicsit magasabb kockazat")
+
+    # b) Pullback / visszateszt
+    if supports:
+        pb = supports[0]
+        lines.append(f"  b) PULLBACK belepes: {_P(pb)} zona (tamasz visszateszt)")
+        lines.append(f"     Pro: jobb ar, teszteli a tamaszt, alacsonyabb kockazat")
+        lines.append(f"     Kontra: lehet hogy nem jon vissza ide")
+    elif resists:
+        pb = resists[0]
+        lines.append(f"  b) VISSZATESZT belepes: {_P(pb)} zona")
+        lines.append(f"     Pro: megerositi az ellenallast tamaszként (short: tamaszként)")
+        lines.append(f"     Kontra: rosszabb ar ha nem jon vissza")
+
+    # c) Breakdown/breakout
+    if resists:
+        lines.append(f"  c) BREAKOUT belepes: {_P(resists[0])} folott (long) vagy alatta (short)")
+        lines.append(f"     Pro: megerositett mozgas, eros momentum")
+        lines.append(f"     Kontra: rosszabb entry, kisebb R:R")
+
+    # Ajánlás
+    if rsi > 70:
+        lines.append(f"\n  AJÁNLÁS: (b) opció — RSI {rsi:.0f} tulvett, varj pullback-re.")
+    elif rsi < 30:
+        lines.append(f"\n  AJÁNLÁS: (a) opció — RSI {rsi:.0f} tuleladott, azonnali belepes indokolt.")
+    else:
+        lines.append(f"\n  AJÁNLÁS: (b) opció a legoptimálisabb swing tradinghez.")
+
+    return "\n".join(lines)
+
+
+def _build_detailed_exit(close, sr_levels, atr, fib) -> str:
+    """Reszletes kilepesi strategia."""
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    D = Style.RESET_ALL
+    supports = sorted([l for l in sr_levels if l < close], reverse=True)
+    resists = sorted([l for l in sr_levels if l > close])
+    fib_sorted = sorted(fib.items(), key=lambda x: x[1])
+
+    lines = []
+    targets = []
+    if resists:
+        targets.append((resists[0], "legkozelebbi ellenallas"))
+    if len(resists) > 1:
+        targets.append((resists[1], "masodik ellenallas"))
+    for fn, fv in fib_sorted:
+        if fv > close * 1.05 and len(targets) < 3:
+            targets.append((fv, fn))
+
+    if targets:
+        pct_alloc = [33, 33, 34] if len(targets) >= 3 else [50, 50] if len(targets) == 2 else [100]
+        for i, (t, reason) in enumerate(targets[:3]):
+            pct_gain = (t - close) / close * 100
+            lines.append(f"  Target {i+1}: {_P(t)} (+{pct_gain:.1f}%) — zard a pozicio {pct_alloc[i]}%-at")
+            lines.append(f"    Miert itt: {reason}")
+
+    lines.append(f"\n  TRAILING STOP:")
+    lines.append(f"    Target 1 elerese utan huzd be a stopot az entry arra (breakeven).")
+    lines.append(f"    Igy a maradek pozicion mar nem tudsz vesziteni.")
+
+    days_est = abs(targets[0][0] - close) / atr if targets and atr > 0 else 0
+    lines.append(f"\n  IDOZITES:")
+    lines.append(f"    ATR ({atr/close*100:.1f}%) alapjan Target 1 ~{days_est:.0f} nap alatt erheto el.")
+    lines.append(f"    Ha {max(10, int(days_est*2))} nap utan nincs elmozdulas, zard a poziciot.")
+
+    return "\n".join(lines)
+
+
+def _build_detailed_risk(df, close, atr, vol_24h, rsi, mtf_result,
+                         penalty, pump_flags) -> str:
+    """Reszletes kockazati faktorok."""
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    factors = []
+    # Positiv
+    if mtf_result:
+        bc = mtf_result.get("bull_count", 0)
+        brc = mtf_result.get("bear_count", 0)
+        if bc >= 3:
+            factors.append((True, f"{bc}/4 bullish MTF — eros megerosites"))
+        elif brc >= 3:
+            factors.append((True, f"{brc}/4 bearish MTF — eros megerosites"))
+        else:
+            factors.append((None, f"MTF vegyes ({bc}/4 bull) — nincs egyertelmu irany"))
+
+    macd_v = df["macd"].iloc[-1] if "macd" in df else 0
+    macd_s = df["macd_signal"].iloc[-1] if "macd_signal" in df else 0
+    if abs(macd_v - macd_s) > 0:
+        factors.append((True, "MACD es jelzes egyeznek"))
+
+    if not pump_flags:
+        factors.append((True, "Nincs pump penalty — organikus mozgas"))
+    else:
+        factors.append((False, f"Pump penalty: {', '.join(pump_flags)}"))
+
+    # Figyelmeztetesek
+    atr_pct = atr / close * 100
+    if atr_pct > 10:
+        factors.append((False, f"ATR {atr_pct:.1f}% — extrem volatilitas"))
+    elif atr_pct > 6:
+        factors.append((None, f"ATR {atr_pct:.1f}% — kozepes volatilitas"))
+    else:
+        factors.append((True, f"ATR {atr_pct:.1f}% — elfogadhato volatilitas"))
+
+    if vol_24h > 5_000_000:
+        factors.append((True, f"24h volume ${vol_24h/1e6:.1f}M — jo likviditas"))
+    elif vol_24h > 500_000:
+        factors.append((None, f"24h volume ${vol_24h/1e3:.0f}K — elfogadhato"))
+    else:
+        factors.append((False, f"24h volume ${vol_24h/1e3:.0f}K — alacsony likviditas"))
+
+    dd90 = _calc_max_drawdown(df, min(90, len(df)))
+    if dd90 < -50:
+        factors.append((False, f"Max drawdown 90 nap: {dd90:.0f}% — magas kockazat"))
+    elif dd90 < -30:
+        factors.append((None, f"Max drawdown 90 nap: {dd90:.0f}%"))
+    else:
+        factors.append((True, f"Max drawdown 90 nap: {dd90:.0f}% — elfogadhato"))
+
+    lines = []
+    for is_good, text in factors:
+        icon = f"{G}V{D}" if is_good is True else (f"{R}X{D}" if is_good is False else f"{Y}!{D}")
+        lines.append(f"  {icon} {text}")
+
+    # Osszesites
+    bads = sum(1 for g, _ in factors if g is False)
+    goods = sum(1 for g, _ in factors if g is True)
+    if bads >= 3:
+        level = f"{R}MAGAS{D}"
+    elif bads >= 2 or goods < 2:
+        level = f"{Y}KOZEPES{D}"
+    else:
+        level = f"{G}ALACSONY{D}"
+    lines.append(f"\n  OSSZESITETT KOCKAZAT: {level}")
+
+    return "\n".join(lines)
+
+
 def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
                   binance_extra: dict | None = None,
                   mtf_result: dict | None = None) -> dict:
@@ -1176,49 +1492,44 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     adx_v = last.get('adx', 0)
     print(f"  ADX: {adx_v:.1f} (+DI: {last['plus_di']:.1f} -DI: {last['minus_di']:.1f}) | Cross: {detect_golden_death_cross(df)}")
 
-    # ---- KONTEXTUS ----
-    print(f"\n{M} KONTEXTUS ERTELMEZES{D}")
+    # ---- RESZLETES TECHNIKAI NARRATIVA ----
+    print(f"\n{M} TECHNIKAI NARRATIVA{D}")
     print(f"{'-' * W}")
-    # Word wrap context at W chars
-    words = context.split()
-    line = " "
-    for w in words:
-        if len(line) + len(w) + 1 > W:
-            print(line)
-            line = "  " + w
-        else:
-            line += " " + w
-    if line.strip():
-        print(line)
+    narrative = _build_narrative(df, last, close, rsi, atr, chg, sr_levels,
+                                 fib, mtf_result, large_candles, vol_24h)
+    print(_wrap(narrative, W))
 
-    # ---- SZINTEK ----
-    print(f"\n{M} BELEPESI / KILEPESI SZINTEK{D}")
+    # ---- SZINTEK (tomor) ----
+    print(f"\n{M} SZINTEK{D}")
     print(f"{'-' * W}")
     if levels["nearest_support"]:
-        print(f"  Legkozelebbi tamasz:     {G}{_P(levels['nearest_support'])}{D}")
+        print(f"  Tamasz:       {G}{_P(levels['nearest_support'])}{D}")
     if levels["nearest_resist"]:
-        print(f"  Legkozelebbi ellenallas: {R}{_P(levels['nearest_resist'])}{D}")
-    print(f"  Optimalis belepes:       {_P(levels['entry'])}")
-    print(f"  Stop-loss:               {R}{_P(levels['stop'])}{D} (kockazat: {levels['risk'] / close * 100:.1f}%)")
-    print(f"  Take-profit #1:          {G}{_P(levels['target1'])}{D} (+{levels['reward1'] / close * 100:.1f}%)")
-    print(f"  Take-profit #2:          {G}{_P(levels['target2'])}{D}")
-    print(f"  Risk/Reward:             1:{levels['rr1']:.1f}")
-
-    # Fibonacci
-    print(f"  Fibonacci szintek:")
+        print(f"  Ellenallas:   {R}{_P(levels['nearest_resist'])}{D}")
+    print(f"  Fibonacci:")
     for name, val in sorted(fib.items(), key=lambda x: x[1], reverse=True)[:5]:
         marker = " <<" if abs(close - val) / close < 0.02 else ""
         print(f"    {name:<12} {_P(val)}{Y}{marker}{D}")
 
-    # ---- SZCENARIÓ ----
+    # ---- BELEPESI STRATEGIA ----
+    print(f"\n{M} BELEPESI STRATEGIA{D}")
+    print(f"{'-' * W}")
+    sma20_v = float(last.get("sma_20", close))
+    print(_build_detailed_entry(close, sr_levels, atr, rsi, fib, sma20_v))
+
+    # ---- KILEPESI STRATEGIA ----
+    print(f"\n{M} KILEPESI STRATEGIA{D}")
+    print(f"{'-' * W}")
+    print(_build_detailed_exit(close, sr_levels, atr, fib))
+
+    # ---- SZCENARIÓ ELEMZES ----
     print(f"\n{M} SZCENARIÓ ELEMZES{D}")
     print(f"{'-' * W}")
-    print(f"  {G}BULLISH ({scenarios['bull_prob']}%):{D} {scenarios['bull']}")
-    print(f"  {R}BEARISH ({scenarios['bear_prob']}%):{D} {scenarios['bear']}")
-    print(f"  {Y}SEMLEGES:{D} {scenarios['neutral']}")
+    print(_build_detailed_scenarios(df, close, sr_levels, atr,
+                                     last.get("adx", 0), rsi, mtf_result, fib))
 
     # ---- WHALE / SMART MONEY ----
-    print(f"\n{M} WHALE / SMART MONEY JELZESEK{D}")
+    print(f"\n{M} WHALE / SMART MONEY{D}")
     print(f"{'-' * W}")
     vol = df["volume"].fillna(0)
     if len(vol) >= 30:
@@ -1239,33 +1550,20 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
             print(f"    {lc['date']}: {direction} {abs(lc['pct']):.1f}%{D} (vol: {lc['vol_ratio']:.1f}x atlag)")
     else:
         print(f"  Nincs kiemelkedo gyertya az elmult 5 napban.")
-    if binance_extra:
-        if binance_extra.get("liquidity"):
-            print(f"  DEX Liquidity: ${binance_extra['liquidity']:,.0f}")
-        if binance_extra.get("trades_24h"):
-            print(f"  24h tranzakciok: {binance_extra['trades_24h']:,}")
+    if binance_extra and binance_extra.get("trades_24h"):
+        print(f"  24h tranzakciok: {binance_extra['trades_24h']:,}")
 
     # ---- KOCKAZAT ----
     print(f"\n{M} KOCKAZAT ERTEKELES{D}")
     print(f"{'-' * W}")
-    print(f"  ATR (14 nap):        {_P(atr)} ({pos['volatility_pct']:.1f}%)")
-    dd30 = _calc_max_drawdown(df, 30) if len(df) >= 30 else 0
-    dd90 = _calc_max_drawdown(df, min(90, len(df)))
-    print(f"  Max drawdown 30 nap: {R}{dd30:.1f}%{D}")
-    print(f"  Max drawdown 90 nap: {R}{dd90:.1f}%{D}")
-    print(f"  Likviditas:          {pos['liquidity_note']}")
-    # Position sizing for 10k portfolio
-    print(f"  Poziciomeret ($10,000 portfolio):")
-    print(f"    Max kockazat:      {pos['max_risk_pct']:.1f}% (${pos['risk_usd']:.0f})")
-    print(f"    Javasolt pozicio:  ${pos['position_usd']:,.0f} ({pos['position_pct']:.0f}% portfolio)")
+    print(_build_detailed_risk(df, close, atr, vol_24h, rsi, mtf_result,
+                                penalty, pump_flags))
+    print(f"\n  Poziciomeret ($10,000 portfolio):")
+    print(f"    Max kockazat:  {pos['max_risk_pct']:.1f}% (${pos['risk_usd']:.0f})")
+    print(f"    Javasolt:      ${pos['position_usd']:,.0f} ({pos['position_pct']:.0f}%)")
     if atr > 0:
         days_to_target = abs(levels["reward1"]) / atr
-        print(f"  Becsult ido celarig: ~{days_to_target:.0f} nap (ATR alapu becses)")
-
-    # ---- IDOZITES ----
-    print(f"\n{M} IDOZITES{D}")
-    print(f"{'-' * W}")
-    print(f"  {Y}{timing}{D}")
+        print(f"  Becsult ido celarig: ~{days_to_target:.0f} nap")
 
     # ---- PUMP SZURO ----
     if pump_flags:
@@ -1274,7 +1572,7 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         for f in pump_flags:
             print(f"  {R}>>{D} {f}")
         if pump_warn:
-            print(f"  {R}FIGYELEM: Magas pump kockazat! A score {raw_score} -> {score} csokkenve.{D}")
+            print(f"  {R}FIGYELEM: Magas pump kockazat!{D}")
 
     # ---- MTF ----
     if mtf_result:
