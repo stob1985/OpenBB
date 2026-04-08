@@ -34,7 +34,10 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 import requests
+from colorama import Fore, Style, init as colorama_init
 from scipy.signal import argrelextrema
+
+colorama_init(autoreset=True)
 
 BINANCE_BASE_URL = "https://api.binance.us/api/v3"
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
@@ -765,75 +768,372 @@ def plot_chart(df: pd.DataFrame, symbol: str, sr_levels: list) -> None:
 
 
 # ============================================================================
-# 10. SZOVEGES OSSZEFOGLALO
+# 10. RESZLETES DONTES-TAMOGATO ELEMZES
 # ============================================================================
+_P = lambda v: f"${v:,.6g}"  # price formatter
+
+
+def _calc_atr(df: pd.DataFrame, period: int = 14) -> float:
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+
+def _calc_max_drawdown(df: pd.DataFrame, window: int = 30) -> float:
+    c = df["close"].iloc[-window:]
+    peak = c.cummax()
+    dd = (c - peak) / peak
+    return float(dd.min()) * 100
+
+
+def _detect_large_candles(df: pd.DataFrame, threshold: float = 0.03, lookback: int = 5) -> list:
+    candles = []
+    for i in range(-min(lookback, len(df)), 0):
+        row = df.iloc[i]
+        prev_close = df.iloc[i - 1]["close"] if i > -len(df) else row["open"]
+        if prev_close == 0:
+            continue
+        pct = (row["close"] - prev_close) / prev_close
+        if abs(pct) >= threshold:
+            vol_avg = df["volume"].iloc[max(0, len(df) + i - 20):len(df) + i].mean()
+            vol_ratio = row["volume"] / vol_avg if vol_avg > 0 else 0
+            candles.append({
+                "date": df.index[i].strftime("%m-%d"),
+                "pct": pct * 100,
+                "vol_ratio": vol_ratio,
+            })
+    return candles
+
+
+def _build_entry_exit(close: float, sr_levels: list, atr: float, fib: dict) -> dict:
+    supports = sorted([l for l in sr_levels if l < close], reverse=True)
+    resists = sorted([l for l in sr_levels if l > close])
+    fib_levels = sorted(fib.values())
+
+    entry = supports[0] if supports else close - atr
+    stop = (supports[1] if len(supports) > 1 else entry - atr) - atr * 0.2
+    target1 = resists[0] if resists else close + atr * 2
+    target2 = resists[1] if len(resists) > 1 else target1 + atr
+
+    risk = close - stop
+    reward1 = target1 - close
+    rr1 = reward1 / risk if risk > 0 else 0
+
+    return {
+        "entry": entry, "stop": stop,
+        "target1": target1, "target2": target2,
+        "risk": risk, "reward1": reward1, "rr1": rr1,
+        "nearest_support": supports[0] if supports else None,
+        "nearest_resist": resists[0] if resists else None,
+    }
+
+
+def _build_context(df: pd.DataFrame, sr_levels: list) -> str:
+    last = df.iloc[-1]
+    rsi = last.get("rsi", 50)
+    macd_bull = last.get("macd", 0) > last.get("macd_signal", 0)
+    adx = last.get("adx", 0)
+    plus_di = last.get("plus_di", 0)
+    minus_di = last.get("minus_di", 0)
+    vol = df["volume"].fillna(0)
+    vol_trend = ""
+    if len(vol) >= 6:
+        recent_avg = vol.iloc[-5:].mean()
+        older_avg = vol.iloc[-20:-5].mean() if len(vol) >= 20 else vol.iloc[:-5].mean()
+        if older_avg > 0:
+            if recent_avg > older_avg * 1.3:
+                vol_trend = "novekvo"
+            elif recent_avg < older_avg * 0.7:
+                vol_trend = "csokken"
+            else:
+                vol_trend = "stabil"
+
+    parts = []
+    # RSI + MACD combo
+    if rsi > 70 and macd_bull:
+        parts.append(f"RSI {rsi:.0f} + MACD bullish = a momentum meg tart, DE kozel a tulvett zonahoz, ami korrekcios kockazatot jelent 1-3 napon belul.")
+    elif rsi > 70 and not macd_bull:
+        parts.append(f"RSI {rsi:.0f} tulvett + MACD bearish = bearish DIVERGENCIA. A momentum gyengul, korrekcio valoszinu.")
+    elif rsi < 30 and not macd_bull:
+        parts.append(f"RSI {rsi:.0f} tuleladott + MACD bearish = meg nem latszik fordulat, de a tulado zona kozel. Figyelj MACD crossoverre.")
+    elif rsi < 30 and macd_bull:
+        parts.append(f"RSI {rsi:.0f} tuleladott + MACD bullish cross = lehetseges fordulat/pattanas jelzes!")
+    elif 45 <= rsi <= 55:
+        parts.append(f"RSI {rsi:.0f} semleges zoneban - nincs egyertelmu momentum irany.")
+    else:
+        direction = "enyhen bullish" if rsi > 50 else "enyhen bearish"
+        parts.append(f"RSI {rsi:.0f} ({direction}) {'+ MACD tamogatja.' if (rsi > 50) == macd_bull else '+ MACD nem erositi meg.'}")
+
+    # Volume divergence
+    if rsi > 65 and vol_trend == "csokken":
+        parts.append("Volumen csokken mig ar magas = bearish divergencia, gyengulo felszallo nyomas.")
+    elif rsi < 35 and vol_trend == "csokken":
+        parts.append("Volumen csokken alacsony RSI mellett = az eladoi nyomas kimerulhet.")
+    elif vol_trend == "novekvo":
+        parts.append("Novekvo volumen erositi az aktualis mozgast.")
+
+    # ADX trend
+    if adx > 25:
+        trend_dir = "felszallo" if plus_di > minus_di else "leszallo"
+        parts.append(f"ADX {adx:.0f} = eros {trend_dir} trend. Trend-koveto strategia javasolt.")
+    else:
+        parts.append(f"ADX {adx:.0f} = gyenge trend / oldalazas. Range-trading lehetoseg.")
+
+    return " ".join(parts)
+
+
+def _build_scenarios(close: float, levels: dict, atr: float, adx: float) -> dict:
+    nr = levels["nearest_resist"]
+    ns = levels["nearest_support"]
+    t1, t2 = levels["target1"], levels["target2"]
+
+    bull = f"Ha attori a(z) {_P(nr)} ellenallast: kovetkezo celar {_P(t1)}"
+    if t2 > t1:
+        bull += f", majd {_P(t2)}."
+    else:
+        bull += "."
+    bull_prob = 55 if adx > 25 else 40
+
+    bear_target = ns - atr if ns else close - atr * 2
+    bear = f"Ha elveszti a(z) {_P(ns)} tamaszt: kovetkezo support {_P(bear_target)}, "
+    bear += f"varhato eses {abs(close - bear_target) / close * 100:.1f}%."
+    bear_prob = 100 - bull_prob
+
+    neutral = f"Konszolidacio {_P(ns or close - atr)} - {_P(nr or close + atr)} tartomanyban."
+
+    return {
+        "bull": bull, "bull_prob": bull_prob,
+        "bear": bear, "bear_prob": bear_prob,
+        "neutral": neutral,
+    }
+
+
+def _build_timing(df: pd.DataFrame, sr_levels: list, atr: float) -> str:
+    last = df.iloc[-1]
+    rsi = last.get("rsi", 50)
+    macd_v = last.get("macd", 0)
+    macd_s = last.get("macd_signal", 0)
+    close = last["close"]
+
+    signals_bullish = 0
+    signals_bearish = 0
+    if rsi < 35:
+        signals_bullish += 1
+    elif rsi > 65:
+        signals_bearish += 1
+    if macd_v > macd_s:
+        signals_bullish += 1
+    else:
+        signals_bearish += 1
+    if close > last.get("sma_20", close):
+        signals_bullish += 1
+    else:
+        signals_bearish += 1
+
+    if rsi > 70:
+        return "VARJ belepessel. RSI tulvett zonahoz kozel - varj korrekciot vagy RSI 50 ala visszahuzodast."
+    if rsi < 30 and macd_v > macd_s:
+        return "MOST LEPJ BE (long). Tuleladott RSI + MACD bullish cross = fordulat jelzes."
+    if signals_bullish >= 3:
+        return "MOST LEPJ BE (long). Tobb indikator egyutt ad veteli jelzest."
+    if signals_bearish >= 3:
+        return "KERÜLD most. Tobb indikator bearish - varj stabilizalodasra."
+    return "VARJ megerositesre. A jelzesek vegyesek, nincs egyertelmu belepo."
+
+
+def _position_size(portfolio: float, close: float, atr: float, stop_dist: float,
+                   vol_24h: float) -> dict:
+    volatility_pct = atr / close * 100 if close > 0 else 10
+    if volatility_pct > 8:
+        max_risk_pct = 1.0
+    elif volatility_pct > 4:
+        max_risk_pct = 2.0
+    else:
+        max_risk_pct = 3.0
+
+    if vol_24h < 100_000:
+        max_risk_pct *= 0.5
+        liquidity_note = "ALACSONY likviditas! Felezo poziciomeret!"
+    elif vol_24h < 500_000:
+        max_risk_pct *= 0.75
+        liquidity_note = "Kozepes likviditas."
+    else:
+        liquidity_note = "Megfelelo likviditas."
+
+    risk_usd = portfolio * max_risk_pct / 100
+    stop_pct = stop_dist / close * 100 if close > 0 else 5
+    position_usd = risk_usd / (stop_pct / 100) if stop_pct > 0 else 0
+    position_usd = min(position_usd, portfolio * 0.2)
+
+    return {
+        "max_risk_pct": max_risk_pct,
+        "risk_usd": risk_usd,
+        "position_usd": position_usd,
+        "position_pct": position_usd / portfolio * 100 if portfolio > 0 else 0,
+        "volatility_pct": volatility_pct,
+        "liquidity_note": liquidity_note,
+    }
+
+
 def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
                   binance_extra: dict | None = None) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    close = last["close"]
+    rsi = last.get("rsi", 50)
+    chg = ((close / prev["close"]) - 1) * 100
     score, rec = calc_swing_score(df, sr_levels)
     alerts = generate_alerts(df, sr_levels)
-    cross = detect_golden_death_cross(df)
+    fib = calc_fibonacci_retracement(df)
+    atr = _calc_atr(df) if len(df) >= 15 else abs(last["high"] - last["low"])
+    levels = _build_entry_exit(close, sr_levels, atr, fib)
+    context = _build_context(df, sr_levels)
+    scenarios = _build_scenarios(close, levels, atr, last.get("adx", 0))
+    timing = _build_timing(df, sr_levels, atr)
+    vol_24h = binance_extra.get("quote_volume_24h", 0) if binance_extra else df["volume"].iloc[-1]
+    pos = _position_size(10000, close, atr, levels["risk"], vol_24h)
+    large_candles = _detect_large_candles(df)
 
-    print("\n" + "=" * 70)
-    print(f"  {symbol} — Swing Trading Osszefoglalo")
-    print("=" * 70)
-    print(f"  Datum:              {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
-    print(f"  Zaroar:             ${last['close']:,.4g}")
-    chg = ((last['close'] / prev['close']) - 1) * 100
-    print(f"  Valtozas (1 nap):   {chg:+.2f}%")
+    W = 70
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    M = Fore.MAGENTA + Style.BRIGHT
+    D = Style.RESET_ALL
 
+    score_color = G if score >= 60 else (Y if score >= 40 else R)
+
+    # ---- AKCIO TERV ----
+    print(f"\n{B}{'=' * W}")
+    print(f" AKCIO TERV: {symbol}")
+    print(f"{'=' * W}{D}")
+
+    action_icon = G + "VETEL" if score >= 60 else (R + "ELADAS" if score < 40 else Y + "VARJ")
+    print(f" {action_icon}{D} | Score: {score_color}{score}/100 ({rec}){D}")
+    print(f" {timing}")
+    if levels["nearest_support"]:
+        print(f"   Belepes: {G}{_P(levels['entry'])}{D} zona")
+        print(f"   Stop:    {R}{_P(levels['stop'])}{D} | "
+              f"Target: {G}{_P(levels['target1'])}{D} | "
+              f"R:R = 1:{levels['rr1']:.1f}")
+    print(f"{B}{'=' * W}{D}")
+
+    # ---- TECHNIKAI ----
+    print(f"\n{M} TECHNIKAI INDIKATOROK{D}")
+    print(f"{'-' * W}")
+    print(f"  Ar: {_P(close)} ({chg:+.2f}%) | VWAP: {_P(last['vwap'])}")
+    print(f"  SMA 20/50/200: {_P(last['sma_20'])} / {_P(last['sma_50'])}", end="")
+    print(f" / {_P(last['sma_200'])}" if pd.notna(last["sma_200"]) else " / N/A")
+    print(f"  BB: {_P(last['bb_lower'])} - {_P(last['bb_upper'])} "
+          f"(%B: {(close - last['bb_lower']) / (last['bb_upper'] - last['bb_lower']):.0%})" if pd.notna(last["bb_upper"]) else "")
+    print(f"  RSI: {rsi:.1f} | MACD: {last['macd']:.4g} (sig: {last['macd_signal']:.4g})")
+    adx_v = last.get('adx', 0)
+    print(f"  ADX: {adx_v:.1f} (+DI: {last['plus_di']:.1f} -DI: {last['minus_di']:.1f}) | Cross: {detect_golden_death_cross(df)}")
+
+    # ---- KONTEXTUS ----
+    print(f"\n{M} KONTEXTUS ERTELMEZES{D}")
+    print(f"{'-' * W}")
+    # Word wrap context at W chars
+    words = context.split()
+    line = " "
+    for w in words:
+        if len(line) + len(w) + 1 > W:
+            print(line)
+            line = "  " + w
+        else:
+            line += " " + w
+    if line.strip():
+        print(line)
+
+    # ---- SZINTEK ----
+    print(f"\n{M} BELEPESI / KILEPESI SZINTEK{D}")
+    print(f"{'-' * W}")
+    if levels["nearest_support"]:
+        print(f"  Legkozelebbi tamasz:     {G}{_P(levels['nearest_support'])}{D}")
+    if levels["nearest_resist"]:
+        print(f"  Legkozelebbi ellenallas: {R}{_P(levels['nearest_resist'])}{D}")
+    print(f"  Optimalis belepes:       {_P(levels['entry'])}")
+    print(f"  Stop-loss:               {R}{_P(levels['stop'])}{D} (kockazat: {levels['risk'] / close * 100:.1f}%)")
+    print(f"  Take-profit #1:          {G}{_P(levels['target1'])}{D} (+{levels['reward1'] / close * 100:.1f}%)")
+    print(f"  Take-profit #2:          {G}{_P(levels['target2'])}{D}")
+    print(f"  Risk/Reward:             1:{levels['rr1']:.1f}")
+
+    # Fibonacci
+    print(f"  Fibonacci szintek:")
+    for name, val in sorted(fib.items(), key=lambda x: x[1], reverse=True)[:5]:
+        marker = " <<" if abs(close - val) / close < 0.02 else ""
+        print(f"    {name:<12} {_P(val)}{Y}{marker}{D}")
+
+    # ---- SZCENARIÓ ----
+    print(f"\n{M} SZCENARIÓ ELEMZES{D}")
+    print(f"{'-' * W}")
+    print(f"  {G}BULLISH ({scenarios['bull_prob']}%):{D} {scenarios['bull']}")
+    print(f"  {R}BEARISH ({scenarios['bear_prob']}%):{D} {scenarios['bear']}")
+    print(f"  {Y}SEMLEGES:{D} {scenarios['neutral']}")
+
+    # ---- WHALE / SMART MONEY ----
+    print(f"\n{M} WHALE / SMART MONEY JELZESEK{D}")
+    print(f"{'-' * W}")
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 30:
+        avg_30 = vol.iloc[-31:-1].mean()
+        avg_5 = vol.iloc[-5:].mean()
+        ratio_5d = avg_5 / avg_30 if avg_30 > 0 else 0
+        vol_tag = G + "NOVEKVO" if ratio_5d > 1.3 else (R + "CSOKKEN" if ratio_5d < 0.7 else Y + "STABIL")
+        print(f"  5 napos vol / 30 napos atlag: {ratio_5d:.2f}x ({vol_tag}{D})")
+    vp = calc_volume_profile(df, bins=15)
+    if not vp.empty:
+        peak_idx = vp["volume"].idxmax()
+        peak_price = vp.loc[peak_idx, "price"]
+        print(f"  Legnagyobb akkumulacios zona: {_P(peak_price)}")
+    if large_candles:
+        print(f"  Nagy gyertyak (>3% mozgas, utolso 5 nap):")
+        for lc in large_candles:
+            direction = G + "FEL" if lc["pct"] > 0 else R + "LE"
+            print(f"    {lc['date']}: {direction} {abs(lc['pct']):.1f}%{D} (vol: {lc['vol_ratio']:.1f}x atlag)")
+    else:
+        print(f"  Nincs kiemelkedo gyertya az elmult 5 napban.")
     if binance_extra:
-        print("-" * 70)
-        print(f"  Binance 24h adatok:")
-        print(f"    24h High/Low:     ${binance_extra['high_24h']:,.4g} / ${binance_extra['low_24h']:,.4g}")
-        print(f"    24h Volume:       {binance_extra['volume_24h']:,.2f} (${binance_extra['quote_volume_24h']:,.0f})")
-        print(f"    24h Change:       {binance_extra['change_pct']:+.2f}%")
-        print(f"    Bid/Ask:          ${binance_extra['bid']:,.4g} / ${binance_extra['ask']:,.4g}")
-        spread = binance_extra['ask'] - binance_extra['bid']
-        spread_pct = spread / binance_extra['ask'] * 100 if binance_extra['ask'] > 0 else 0
-        print(f"    Spread:           ${spread:,.4g} ({spread_pct:.4f}%)")
-        print(f"    Trades 24h:       {binance_extra['trades_24h']:,}")
-        if binance_extra.get("funding_rate") is not None:
-            print(f"    Funding Rate:     {binance_extra['funding_rate'] * 100:.4f}%")
         if binance_extra.get("liquidity"):
-            print(f"    Liquidity:        ${binance_extra['liquidity']:,.0f}")
-        if binance_extra.get("dex"):
-            print(f"    DEX/Chain:        {binance_extra['dex']} / {binance_extra.get('chain', '?')}")
-        if binance_extra.get("market_cap"):
-            print(f"    Market Cap:       ${binance_extra['market_cap']:,.0f}")
+            print(f"  DEX Liquidity: ${binance_extra['liquidity']:,.0f}")
+        if binance_extra.get("trades_24h"):
+            print(f"  24h tranzakciok: {binance_extra['trades_24h']:,}")
 
-    print("-" * 70)
-    print(f"  SMA 20/50/200:      ${last['sma_20']:,.4g} / ${last['sma_50']:,.4g}", end="")
-    if pd.notna(last["sma_200"]):
-        print(f" / ${last['sma_200']:,.4g}")
-    else:
-        print(" / N/A")
-    print(f"  Bollinger:          ${last['bb_lower']:,.4g} - ${last['bb_upper']:,.4g}")
-    bb_pct = (last["close"] - last["bb_lower"]) / (last["bb_upper"] - last["bb_lower"])
-    print(f"  BB %B:              {bb_pct:.1%}")
-    print("-" * 70)
-    rsi = last["rsi"]
-    rsi_tag = " TULVETT!" if rsi > 80 else (" TULELADOTT!" if rsi < 20 else "")
-    print(f"  RSI (14):           {rsi:.1f}{rsi_tag}")
-    print(f"  MACD / Szignal:     {last['macd']:.4g} / {last['macd_signal']:.4g}")
-    print(f"  ADX:                {last['adx']:.1f}  (+DI: {last['plus_di']:.1f}  -DI: {last['minus_di']:.1f})")
-    print(f"  SMA Cross:          {cross}")
-    print(f"  VWAP:               ${last['vwap']:,.4g}")
-    print("-" * 70)
-    print(f"  SWING SCORE:        {score}/100  ->  {rec}")
-    print("-" * 70)
+    # ---- KOCKAZAT ----
+    print(f"\n{M} KOCKAZAT ERTEKELES{D}")
+    print(f"{'-' * W}")
+    print(f"  ATR (14 nap):        {_P(atr)} ({pos['volatility_pct']:.1f}%)")
+    dd30 = _calc_max_drawdown(df, 30) if len(df) >= 30 else 0
+    dd90 = _calc_max_drawdown(df, min(90, len(df)))
+    print(f"  Max drawdown 30 nap: {R}{dd30:.1f}%{D}")
+    print(f"  Max drawdown 90 nap: {R}{dd90:.1f}%{D}")
+    print(f"  Likviditas:          {pos['liquidity_note']}")
+    # Position sizing for 10k portfolio
+    print(f"  Poziciomeret ($10,000 portfolio):")
+    print(f"    Max kockazat:      {pos['max_risk_pct']:.1f}% (${pos['risk_usd']:.0f})")
+    print(f"    Javasolt pozicio:  ${pos['position_usd']:,.0f} ({pos['position_pct']:.0f}% portfolio)")
+    if atr > 0:
+        days_to_target = abs(levels["reward1"]) / atr
+        print(f"  Becsult ido celarig: ~{days_to_target:.0f} nap (ATR alapu becses)")
+
+    # ---- IDOZITES ----
+    print(f"\n{M} IDOZITES{D}")
+    print(f"{'-' * W}")
+    print(f"  {Y}{timing}{D}")
+
+    # ---- ALERTS ----
     if alerts:
-        print("  RIASZTASOK:")
+        print(f"\n{M} RIASZTASOK ({len(alerts)}){D}")
+        print(f"{'-' * W}")
         for a in alerts:
-            print(f"    >> {a}")
-    else:
-        print("  Nincs aktiv riasztas.")
-    print("=" * 70)
+            print(f"  {Y}>>{D} {a}")
+
+    print(f"\n{B}{'=' * W}{D}")
 
     return {
-        "symbol": symbol, "close": last["close"], "change_pct": chg,
-        "rsi": rsi, "adx": last["adx"], "macd": last["macd"],
+        "symbol": symbol, "close": close, "change_pct": chg,
+        "rsi": rsi, "adx": last.get("adx", 0), "macd": last.get("macd", 0),
         "score": score, "rec": rec, "alerts": len(alerts),
     }
 
