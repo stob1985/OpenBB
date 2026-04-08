@@ -1812,8 +1812,494 @@ def run_short_scanner(days: int, interval: str, quote: str,
         print(f"{R}{'=' * 70}{D}")
 
 
+
+
 # ============================================================================
-# 14. FOPROGRAM
+# 14. BACKTESTING MOTOR
+# ============================================================================
+def _rolling_score(df: pd.DataFrame, idx: int, window: int,
+                   side: str) -> tuple:
+    """Score szamitas egy adott pontra az adatban, a pump penaltyvel egyutt."""
+    start = max(0, idx - window + 1)
+    sub = df.iloc[start:idx + 1].copy()
+    if len(sub) < 20:
+        return 0, 0, 0
+    sub["sma_20"] = sub["close"].rolling(20).mean()
+    sub["sma_50"] = sub["close"].rolling(50).mean()
+    sub["sma_200"] = sub["close"].rolling(200).mean()
+    delta = sub["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    ag = gain.ewm(alpha=1/14, min_periods=14).mean()
+    al = loss.ewm(alpha=1/14, min_periods=14).mean()
+    sub["rsi"] = 100 - (100 / (1 + ag / al))
+    ef = sub["close"].ewm(span=12, adjust=False).mean()
+    es = sub["close"].ewm(span=26, adjust=False).mean()
+    sub["macd"] = ef - es
+    sub["macd_signal"] = sub["macd"].ewm(span=9, adjust=False).mean()
+    sub["macd_hist"] = sub["macd"] - sub["macd_signal"]
+    bb_mid = sub["close"].rolling(20).mean()
+    bb_std = sub["close"].rolling(20).std()
+    sub["bb_upper"] = bb_mid + 2 * bb_std
+    sub["bb_lower"] = bb_mid - 2 * bb_std
+    sub["bb_middle"] = bb_mid
+    h, l, c = sub["high"], sub["low"], sub["close"]
+    pdm = h.diff(); mdm = -l.diff()
+    pdm = pdm.where((pdm > mdm) & (pdm > 0), 0.0)
+    mdm = mdm.where((mdm > pdm) & (mdm > 0), 0.0)
+    import pandas as _pd
+    tr = _pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/14, min_periods=14).mean()
+    sub["plus_di"] = 100*(pdm.ewm(alpha=1/14,min_periods=14).mean()/atr)
+    sub["minus_di"] = 100*(mdm.ewm(alpha=1/14,min_periods=14).mean()/atr)
+    dx = 100*(sub["plus_di"]-sub["minus_di"]).abs()/(sub["plus_di"]+sub["minus_di"]).replace(0,np.nan)
+    sub["adx"] = dx.ewm(alpha=1/14, min_periods=14).mean()
+    hi, lo = sub["high"], sub["low"]
+    sub["senkou_a"] = ((hi.rolling(9).max()+lo.rolling(9).min())/2 + (hi.rolling(26).max()+lo.rolling(26).min())/2)/2
+    sub["senkou_b"] = (hi.rolling(52).max()+lo.rolling(52).min())/2
+
+    sr = get_sr_levels(sub)
+
+    if side in ("long", "both"):
+        score, _, raw, pen, _ = calc_swing_score(sub, sr)
+        return score, raw, pen
+    else:
+        from scipy.signal import argrelextrema as _are2
+        sc, _, raw, pen, _ = calc_short_score(sub, sr)
+        return sc, raw, pen
+
+
+def run_backtest(symbol: str, days: int, source: str, provider: str,
+                 interval: str, quote: str, threshold: float,
+                 sl_pct: float, tp_pct: float, capital: float,
+                 risk_pct: float, side: str) -> dict:
+    """Backtest motor egyetlen coinra."""
+    B = Fore.CYAN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    # Extra napok az indikatorokhoz
+    fetch_days = days + 60
+    df = fetch_crypto_data(symbol, fetch_days, source, provider, interval, quote)
+    if len(df) < days:
+        print(f"  {Y}Csak {len(df)} nap adat erheto el.{D}")
+
+    trades = []
+    equity = [capital]
+    current_capital = capital
+    position = None  # {"entry_price", "entry_idx", "entry_date", "size_usd", "direction"}
+    window = min(90, len(df) - 1)
+
+    test_start = max(60, len(df) - days)
+
+    print(f"  Backtest: {symbol} | {side} | {len(df)-test_start} nap | "
+          f"threshold={threshold} SL={sl_pct}% TP={tp_pct}%")
+
+    for i in range(test_start, len(df)):
+        close = df["close"].iloc[i]
+        high = df["high"].iloc[i]
+        low = df["low"].iloc[i]
+        date = df.index[i]
+
+        # Ha van nyitott pozicio: check SL/TP/timeout/score-drop
+        if position is not None:
+            entry = position["entry_price"]
+            days_held = i - position["entry_idx"]
+            direction = position["direction"]
+
+            if direction == "long":
+                pl_pct = (close - entry) / entry * 100
+                hit_sl = low <= entry * (1 - sl_pct / 100)
+                hit_tp = high >= entry * (1 + tp_pct / 100)
+            else:
+                pl_pct = (entry - close) / entry * 100
+                hit_sl = high >= entry * (1 + sl_pct / 100)
+                hit_tp = low <= entry * (1 - tp_pct / 100)
+
+            exit_reason = None
+            exit_price = close
+
+            if hit_sl:
+                exit_reason = "Stop-loss"
+                exit_price = entry * (1 - sl_pct/100) if direction == "long" else entry * (1 + sl_pct/100)
+                pl_pct = -sl_pct
+            elif hit_tp:
+                exit_reason = "Take-profit"
+                exit_price = entry * (1 + tp_pct/100) if direction == "long" else entry * (1 - tp_pct/100)
+                pl_pct = tp_pct
+            elif days_held >= 14:
+                exit_reason = "Timeout (14 nap)"
+            else:
+                # Score check
+                sc, _, _ = _rolling_score(df, i, window, direction)
+                if sc < 40:
+                    exit_reason = f"Score drop ({sc:.0f})"
+
+            if exit_reason:
+                trade_pl_usd = position["size_usd"] * pl_pct / 100
+                current_capital += trade_pl_usd
+                trades.append({
+                    "entry_date": position["entry_date"].strftime("%Y-%m-%d"),
+                    "exit_date": date.strftime("%Y-%m-%d"),
+                    "symbol": symbol,
+                    "direction": direction,
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "pl_pct": pl_pct,
+                    "pl_usd": trade_pl_usd,
+                    "days_held": days_held,
+                    "exit_reason": exit_reason,
+                    "score": position["score"],
+                })
+                position = None
+
+            equity.append(current_capital)
+            continue
+
+        # Nincs pozicio: check signal
+        test_side = side if side != "both" else "long"
+        sc, raw, pen = _rolling_score(df, i, window, test_side)
+
+        # Both: ha long score alacsony, probaljuk short-ot
+        if side == "both" and sc < threshold:
+            sc2, raw2, pen2 = _rolling_score(df, i, window, "short")
+            if sc2 >= threshold:
+                sc, test_side = sc2, "short"
+
+        if sc >= threshold:
+            size_usd = current_capital * risk_pct / 100 / (sl_pct / 100)
+            size_usd = min(size_usd, current_capital * 0.3)
+            if size_usd > 10:  # min $10 pozicio
+                position = {
+                    "entry_price": close,
+                    "entry_idx": i,
+                    "entry_date": date,
+                    "size_usd": size_usd,
+                    "direction": test_side,
+                    "score": sc,
+                }
+
+        equity.append(current_capital)
+
+    # Nyitott pozicio zarasa az utolso napon
+    if position is not None:
+        close = df["close"].iloc[-1]
+        entry = position["entry_price"]
+        direction = position["direction"]
+        pl_pct = ((close - entry)/entry*100) if direction == "long" else ((entry - close)/entry*100)
+        trade_pl_usd = position["size_usd"] * pl_pct / 100
+        current_capital += trade_pl_usd
+        trades.append({
+            "entry_date": position["entry_date"].strftime("%Y-%m-%d"),
+            "exit_date": df.index[-1].strftime("%Y-%m-%d"),
+            "symbol": symbol, "direction": direction,
+            "entry_price": entry, "exit_price": close,
+            "pl_pct": pl_pct, "pl_usd": trade_pl_usd,
+            "days_held": len(df) - 1 - position["entry_idx"],
+            "exit_reason": "Vegso zaras", "score": position["score"],
+        })
+        equity.append(current_capital)
+
+    return {
+        "symbol": symbol, "trades": trades, "equity": equity,
+        "capital": capital, "final": current_capital,
+        "side": side, "threshold": threshold,
+        "sl_pct": sl_pct, "tp_pct": tp_pct,
+        "df": df, "test_start": test_start,
+    }
+
+
+def _calc_backtest_metrics(result: dict) -> dict:
+    trades = result["trades"]
+    equity = result["equity"]
+    capital = result["capital"]
+
+    if not trades:
+        return {"total": 0}
+
+    wins = [t for t in trades if t["pl_pct"] > 0]
+    losses = [t for t in trades if t["pl_pct"] <= 0]
+    pls = [t["pl_pct"] for t in trades]
+    usd_pls = [t["pl_usd"] for t in trades]
+
+    gross_profit = sum(t["pl_usd"] for t in wins) if wins else 0
+    gross_loss = abs(sum(t["pl_usd"] for t in losses)) if losses else 1
+
+    # Max drawdown
+    peak = capital
+    max_dd = 0
+    for eq in equity:
+        if eq > peak:
+            peak = eq
+        dd = (eq - peak) / peak * 100
+        if dd < max_dd:
+            max_dd = dd
+
+    # Sharpe (annualizalt, napi equity-bol)
+    if len(equity) > 2:
+        eq_arr = np.array(equity)
+        returns = np.diff(eq_arr) / eq_arr[:-1]
+        sharpe = (returns.mean() / returns.std() * np.sqrt(365)) if returns.std() > 0 else 0
+    else:
+        sharpe = 0
+
+    return {
+        "total": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(trades) * 100,
+        "avg_profit": np.mean([t["pl_pct"] for t in wins]) if wins else 0,
+        "avg_loss": np.mean([t["pl_pct"] for t in losses]) if losses else 0,
+        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf"),
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "expectancy": np.mean(usd_pls),
+        "best_trade": max(pls),
+        "worst_trade": min(pls),
+        "avg_days": np.mean([t["days_held"] for t in trades]),
+        "final_equity": result["final"],
+        "total_return": (result["final"] - capital) / capital * 100,
+    }
+
+
+def _print_backtest_results(result: dict, metrics: dict) -> None:
+    B = Fore.CYAN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    sym = result["symbol"]
+    trades = result["trades"]
+
+    print(f"\n{B}{'=' * 75}")
+    print(f" BACKTEST EREDMENYEK: {sym} ({result['side'].upper()})")
+    print(f"{'=' * 75}{D}")
+
+    if metrics["total"] == 0:
+        print(f"  {Y}Nincs trade a megadott parameterekkel.{D}")
+        return
+
+    ret_color = G if metrics["total_return"] > 0 else R
+    wr_color = G if metrics["win_rate"] > 50 else (Y if metrics["win_rate"] > 40 else R)
+    pf_color = G if metrics["profit_factor"] > 1.5 else (Y if metrics["profit_factor"] > 1 else R)
+
+    print(f"  Osszes trade:        {metrics['total']}")
+    print(f"  Nyero / vesztes:     {G}{metrics['wins']}{D} / {R}{metrics['losses']}{D}")
+    print(f"  Win rate:            {wr_color}{metrics['win_rate']:.1f}%{D}")
+    print(f"  Atlag profit/trade:  {G}+{metrics['avg_profit']:.2f}%{D}")
+    print(f"  Atlag veszteseg:     {R}{metrics['avg_loss']:.2f}%{D}")
+    print(f"  Profit factor:       {pf_color}{metrics['profit_factor']:.2f}{D}")
+    print(f"  Legjobb trade:       {G}+{metrics['best_trade']:.2f}%{D}")
+    print(f"  Legrosszabb trade:   {R}{metrics['worst_trade']:.2f}%{D}")
+    print(f"  Atlag tartas:        {metrics['avg_days']:.1f} nap")
+    print(f"  Max drawdown:        {R}{metrics['max_drawdown']:.1f}%{D}")
+    print(f"  Sharpe ratio:        {metrics['sharpe']:.2f}")
+    print(f"  Expectancy:          ${metrics['expectancy']:.2f}/trade")
+    print(f"{'-' * 75}")
+    print(f"  Kezdo toke:          ${result['capital']:,.2f}")
+    print(f"  Vegso egyenleg:      {ret_color}${metrics['final_equity']:,.2f}{D}")
+    print(f"  Osszesitett hozam:   {ret_color}{metrics['total_return']:+.2f}%{D}")
+    print(f"{B}{'=' * 75}{D}")
+
+    # Trade log
+    print(f"\n{B} TRADE LOG{D}")
+    print(f"  {'Datum':<12}{'Exit':<12}{'Dir':<6}{'Entry':>10}{'Exit$':>10}"
+          f"{'P/L%':>8}{'P/L$':>10}{'Nap':>5} {'Ok'}")
+    print(f"  {'-' * 80}")
+    for t in trades:
+        c = G if t["pl_pct"] > 0 else R
+        print(
+            f"  {t['entry_date']:<12}{t['exit_date']:<12}"
+            f"{t['direction']:<6}"
+            f"${t['entry_price']:>9,.4g}"
+            f"${t['exit_price']:>9,.4g}"
+            f"  {c}{t['pl_pct']:>+6.2f}%{D}"
+            f"  {c}${t['pl_usd']:>+8.2f}{D}"
+            f"  {t['days_held']:>3}  {t['exit_reason']}"
+        )
+
+
+def _print_score_calibration(trades: list) -> None:
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    if not trades:
+        return
+
+    print(f"\n{B} SCORE KALIBRALAS{D}")
+    print(f"  {'Score tartomany':<20}{'Trades':>8}{'Win%':>8}{'Avg P/L':>10}")
+    print(f"  {'-' * 50}")
+    for lo, hi in [(60, 70), (70, 80), (80, 90), (90, 100)]:
+        bucket = [t for t in trades if lo <= t["score"] < hi]
+        if not bucket:
+            print(f"  {lo}-{hi:<18}{'0':>8}{'–':>8}{'–':>10}")
+            continue
+        wins = sum(1 for t in bucket if t["pl_pct"] > 0)
+        wr = wins / len(bucket) * 100
+        avg = np.mean([t["pl_pct"] for t in bucket])
+        c = G if wr > 50 else (Y if wr > 40 else R)
+        print(f"  {lo}-{hi:<18}{len(bucket):>8}{c}{wr:>7.1f}%{D}{avg:>+9.2f}%")
+
+
+def _plot_equity_curve(result: dict, metrics: dict) -> None:
+    equity = result["equity"]
+    df = result["df"]
+    test_start = result["test_start"]
+    symbol = result["symbol"]
+    capital = result["capital"]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
+                                    height_ratios=[3, 1], sharex=True)
+    fig.suptitle(f"{symbol} Backtest — Equity Curve ({result['side'].upper()})",
+                 fontsize=14, fontweight="bold")
+
+    dates = df.index[test_start:test_start + len(equity)]
+    if len(dates) < len(equity):
+        dates = df.index[-len(equity):]
+
+    # Equity curve
+    ax1.plot(dates[:len(equity)], equity, lw=1.5, color="#1f77b4", label="Equity")
+    ax1.axhline(capital, lw=0.7, ls="--", color="gray", alpha=0.5, label=f"Kezdo (${capital:,.0f})")
+
+    # Buy & hold osszehasonlitas
+    bh_start = df["close"].iloc[test_start]
+    bh_eq = [capital * df["close"].iloc[test_start + j] / bh_start
+             for j in range(min(len(equity), len(df) - test_start))]
+    ax1.plot(dates[:len(bh_eq)], bh_eq, lw=1, ls="--", color="#ff7f0e",
+             alpha=0.7, label="Buy & Hold")
+
+    ax1.set_ylabel("Egyenleg (USD)")
+    ax1.legend(loc="upper left", fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Drawdown
+    eq_arr = np.array(equity)
+    peak = np.maximum.accumulate(eq_arr)
+    dd_pct = (eq_arr - peak) / peak * 100
+    ax2.fill_between(dates[:len(dd_pct)], dd_pct, 0, color="red", alpha=0.3)
+    ax2.plot(dates[:len(dd_pct)], dd_pct, lw=0.8, color="red")
+    ax2.set_ylabel("Drawdown (%)")
+    ax2.set_ylim(min(dd_pct) * 1.2, 5)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fname = f"results/backtest_{symbol}_{datetime.now().strftime('%Y%m%d')}.png"
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"\n  Equity curve mentve: {fname}")
+    plt.close(fig)
+
+
+def _walk_forward(result: dict, capital: float, sl_pct: float,
+                  tp_pct: float, risk_pct: float, side: str) -> None:
+    """Walk-forward teszt: 70% train / 30% test split."""
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    trades = result["trades"]
+    if len(trades) < 6:
+        print(f"\n  {Y}Walk-forward: tul keves trade ({len(trades)}).{D}")
+        return
+
+    split = int(len(trades) * 0.7)
+    train = trades[:split]
+    test = trades[split:]
+
+    train_wins = sum(1 for t in train if t["pl_pct"] > 0)
+    test_wins = sum(1 for t in test if t["pl_pct"] > 0)
+    train_wr = train_wins / len(train) * 100 if train else 0
+    test_wr = test_wins / len(test) * 100 if test else 0
+
+    train_pl = np.mean([t["pl_pct"] for t in train])
+    test_pl = np.mean([t["pl_pct"] for t in test])
+
+    overfit = abs(train_wr - test_wr) > 15
+
+    print(f"\n{B} WALK-FORWARD TESZT (70/30 split){D}")
+    print(f"  {'':20}{'Train':>10}{'Test':>10}")
+    print(f"  {'-' * 42}")
+    print(f"  {'Trades':<20}{len(train):>10}{len(test):>10}")
+    tc = G if train_wr > 50 else R
+    vc = G if test_wr > 50 else R
+    print(f"  {'Win rate':<20}{tc}{train_wr:>9.1f}%{D}{vc}{test_wr:>9.1f}%{D}")
+    print(f"  {'Avg P/L':<20}{train_pl:>+9.2f}%{test_pl:>+9.2f}%")
+    if overfit:
+        print(f"\n  {R}FIGYELEM: Train/test win rate elteres > 15% -> overfitting gyanu!{D}")
+    else:
+        print(f"\n  {G}Train/test konzisztens — nincs overfitting jel.{D}")
+
+
+def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
+                       interval: str, quote: str, threshold: float,
+                       sl_pct: float, tp_pct: float, capital: float,
+                       risk_pct: float, side: str) -> None:
+    """Backtest futtatasa egy vagy tobb coinra."""
+    B = Fore.CYAN + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    print(f"\n{B}{'=' * 75}")
+    print(f" BACKTESTING ENGINE")
+    print(f"{'=' * 75}{D}")
+    print(f"  Coinok: {', '.join(symbols)}")
+    print(f"  Idoszak: {days} nap | Side: {side} | Threshold: {threshold}")
+    print(f"  SL: {sl_pct}% | TP: {tp_pct}% | Capital: ${capital:,.0f} | Risk: {risk_pct}%")
+    print()
+
+    all_results = []
+
+    for sym in symbols:
+        try:
+            result = run_backtest(sym, days, source, provider, interval,
+                                  quote, threshold, sl_pct, tp_pct,
+                                  capital, risk_pct, side)
+            metrics = _calc_backtest_metrics(result)
+            _print_backtest_results(result, metrics)
+            if metrics["total"] > 0:
+                _print_score_calibration(result["trades"])
+                _plot_equity_curve(result, metrics)
+                _walk_forward(result, capital, sl_pct, tp_pct, risk_pct, side)
+            all_results.append((sym, result, metrics))
+        except Exception as e:
+            print(f"  HIBA ({sym}): {e}")
+
+    # Multi-coin osszefoglalo
+    if len(all_results) > 1:
+        print(f"\n{B}{'=' * 85}")
+        print(f" MULTI-COIN BACKTEST OSSZEFOGLALO")
+        print(f"{'=' * 85}{D}")
+        print(f"  {'Coin':<14}{'Trades':>7}{'Win%':>7}{'P/L%':>8}{'PF':>6}"
+              f"{'MaxDD':>8}{'Sharpe':>8}{'Vegso$':>12}")
+        print(f"  {'-' * 72}")
+        for sym, res, m in sorted(all_results, key=lambda x: x[2].get("total_return", 0), reverse=True):
+            if m["total"] == 0:
+                print(f"  {sym:<14}{'0':>7}{'–':>7}{'–':>8}{'–':>6}{'–':>8}{'–':>8}{'–':>12}")
+                continue
+            rc = Fore.GREEN if m["total_return"] > 0 else Fore.RED
+            print(
+                f"  {sym:<14}"
+                f"{m['total']:>7}"
+                f"{m['win_rate']:>6.1f}%"
+                f"{rc}{m['total_return']:>+7.1f}%{D}"
+                f"{m['profit_factor']:>6.2f}"
+                f"{m['max_drawdown']:>7.1f}%"
+                f"{m['sharpe']:>8.2f}"
+                f"  {rc}${m['final_equity']:>9,.2f}{D}"
+            )
+        print(f"{'=' * 85}")
+
+
+# ============================================================================
+# 15. FOPROGRAM
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1844,16 +2330,50 @@ def main() -> None:
                         help="Stablecoinok kiszurese (alapert: igen)")
     parser.add_argument("--detail-threshold", type=float, default=0,
                         help="Reszletes elemzes csak e score felett (0=mindig)")
+    # Backtest
+    parser.add_argument("--backtest", action="store_true",
+                        help="Backtest mod: szimulacio historikus adaton")
+    parser.add_argument("--backtest-days", type=int, default=365,
+                        help="Backtest idoszak napokban (alapert: 365)")
+    parser.add_argument("--backtest-threshold", type=float, default=65,
+                        help="Minimum score a belepeshez (alapert: 65)")
+    parser.add_argument("--backtest-sl", type=float, default=5,
+                        help="Stop-loss %% (alapert: 5)")
+    parser.add_argument("--backtest-tp", type=float, default=10,
+                        help="Take-profit %% (alapert: 10)")
+    parser.add_argument("--backtest-capital", type=float, default=1000,
+                        help="Kezdo toke USD (alapert: 1000)")
+    parser.add_argument("--backtest-risk", type=float, default=2,
+                        help="Pozicionkenti kockazat %% (alapert: 2)")
+    parser.add_argument("--backtest-side", default="long",
+                        choices=["long", "short", "both"],
+                        help="Backtest irany (alapert: long)")
     args = parser.parse_args()
 
     source = args.source
     if args.scan_binance or args.scan_shorts:
+        source = "binance"
+    if args.backtest and source == "openbb":
         source = "binance"
 
     print(f"\nCrypto Swing Trading Analyzer")
     print(f"Idoszak: {args.days} nap | Forras: {source}"
           + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
+
+    if args.backtest:
+        if args.symbols:
+            coin_list = [s.strip() for s in args.symbols.split(",")]
+        elif args.symbol:
+            coin_list = [args.symbol]
+        else:
+            coin_list = ["BTCUSDT"]
+        run_backtest_suite(
+            coin_list, args.backtest_days, source, args.provider,
+            args.interval, args.quote, args.backtest_threshold,
+            args.backtest_sl, args.backtest_tp, args.backtest_capital,
+            args.backtest_risk, args.backtest_side)
+        return
 
     if args.scan_shorts:
         run_short_scanner(args.days, args.interval, args.quote,
