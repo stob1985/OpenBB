@@ -322,6 +322,14 @@ def scan_binance_top_pairs(
         sym = t["symbol"]
         if not sym.endswith(quote):
             continue
+        base = sym[:-len(quote)]
+        # Stablecoin, fiat, leveraged filter
+        if base in STABLECOINS or base in FIAT_BASES:
+            continue
+        if any(sub in base for sub in _BLACKLIST_SUBSTRINGS):
+            continue
+        if any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES):
+            continue
         qv = float(t.get("quoteVolume", 0))
         if qv < min_volume_usd:
             continue
@@ -1390,7 +1398,12 @@ def run_binance_scan(days: int, interval: str, quote: str,
 # 13. SHORT SCANNER
 # ============================================================================
 STABLECOINS = {"USDC", "USDT", "DAI", "TUSD", "BUSD", "FDUSD", "USDP",
-               "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "EUSD", "USDJ"}
+               "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "EUSD", "USDJ",
+               "BFUSD", "XUSD", "USD1", "RLUSD", "U", "AEUR", "EURT",
+               "USDD", "CUSD", "USDY", "USDX", "ZUSD"}
+FIAT_BASES = {"EUR", "GBP", "JPY", "TRY", "AUD", "BRL", "ARS", "PLN",
+              "RON", "UAH", "NGN", "PAXG", "XAUT"}
+_BLACKLIST_SUBSTRINGS = ("USD", "EUR", "GBP", "JPY")  # ha base tartalmazza
 
 _short_scan_cache = {}
 _short_scan_cache_time = None
@@ -1597,6 +1610,12 @@ def _prefilter_short_candidates(tickers: list, min_volume: float,
             continue
         base = sym[:-4]
         if exclude_stablecoins and base in STABLECOINS:
+            continue
+        # Fiat/forex filter
+        if base in FIAT_BASES:
+            continue
+        # Stablecoin substring filter (USD, EUR stb. a nev belsejeben)
+        if exclude_stablecoins and any(sub in base for sub in _BLACKLIST_SUBSTRINGS):
             continue
         # Leveraged token filter (dupla biztonsag)
         if any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES):
