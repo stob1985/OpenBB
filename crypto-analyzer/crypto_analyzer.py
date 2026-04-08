@@ -1101,6 +1101,407 @@ def _position_size(portfolio: float, close: float, atr: float, stop_dist: float,
     }
 
 
+
+
+# ============================================================================
+# ICHIMOKU RESZLETES ELEMZES
+# ============================================================================
+def analyze_ichimoku(df: pd.DataFrame) -> dict:
+    """Ichimoku 5-jelzes elemzes."""
+    if len(df) < 52:
+        return {"score": 0, "bull": 0, "signals": [], "summary": "Nincs eleg adat (min 52 nap)."}
+    close = df["close"].iloc[-1]
+    tenkan = df.get("tenkan")
+    kijun = df.get("kijun")
+    sa = df.get("senkou_a")
+    sb = df.get("senkou_b")
+    if tenkan is None or kijun is None:
+        return {"score": 0, "bull": 0, "signals": [], "summary": "Ichimoku nem szamitott."}
+
+    t = float(tenkan.iloc[-1])
+    k = float(kijun.iloc[-1])
+    s_a = float(sa.iloc[-1]) if sa is not None and pd.notna(sa.iloc[-1]) else close
+    s_b = float(sb.iloc[-1]) if sb is not None and pd.notna(sb.iloc[-1]) else close
+    kumo_top = max(s_a, s_b)
+    kumo_bot = min(s_a, s_b)
+
+    signals = []
+    bull_count = 0
+
+    # 1. TK cross
+    if t > k:
+        signals.append(f"TK cross: Tenkan ({_P(t)}) FELETT Kijun ({_P(k)}) -> bullish")
+        bull_count += 1
+    else:
+        signals.append(f"TK cross: Tenkan ({_P(t)}) ALATT Kijun ({_P(k)}) -> bearish")
+
+    # 2. Ar vs Kumo
+    if close > kumo_top:
+        signals.append(f"Ar ({_P(close)}) a Kumo FELETT -> bullish")
+        bull_count += 1
+    elif close < kumo_bot:
+        signals.append(f"Ar ({_P(close)}) a Kumo ALATT -> bearish")
+    else:
+        signals.append(f"Ar ({_P(close)}) a Kumo-BAN -> semleges/atmeneti")
+
+    # 3. Chikou (ar vs 26 nappal korabbi ar)
+    if len(df) > 26:
+        chikou_ref = df["close"].iloc[-27]
+        if close > chikou_ref:
+            signals.append(f"Chikou: jelenlegi ar > 26 nappal ezelotti ({_P(chikou_ref)}) -> bullish")
+            bull_count += 1
+        else:
+            signals.append(f"Chikou: jelenlegi ar < 26 nappal ezelotti ({_P(chikou_ref)}) -> bearish")
+
+    # 4. Kumo jovobelei alakja (senkou A vs B trend)
+    if sa is not None and len(sa) > 5:
+        recent_sa = [float(x) for x in sa.iloc[-5:] if pd.notna(x)]
+        recent_sb = [float(x) for x in sb.iloc[-5:] if pd.notna(x)]
+        if len(recent_sa) >= 2 and len(recent_sb) >= 2:
+            sa_trend = recent_sa[-1] - recent_sa[0]
+            sb_trend = recent_sb[-1] - recent_sb[0]
+            if sa_trend > 0 and sb_trend > 0:
+                signals.append("Kumo jovoben: mindketto emelkedik -> bullish")
+                bull_count += 1
+            elif sa_trend < 0 and sb_trend < 0:
+                signals.append("Kumo jovoben: mindketto csokken -> bearish")
+            else:
+                # Twist kozelit
+                if abs(recent_sa[-1] - recent_sb[-1]) < abs(recent_sa[0] - recent_sb[0]) * 0.3:
+                    signals.append("Kumo TWIST kozelit! -> potencialis trendvaltas 1-5 napon belul")
+                else:
+                    signals.append("Kumo vegyes iranyu -> atmeneti")
+
+    # 5. Kumo vastagsag
+    thickness = abs(s_a - s_b)
+    thick_pct = thickness / close * 100 if close > 0 else 0
+    if thick_pct > 5:
+        signals.append(f"Kumo vastag ({thick_pct:.1f}%) -> eros S/R zona, nehezen torheto at")
+        bull_count += 1 if close > kumo_top else 0
+    elif thick_pct < 1:
+        signals.append(f"Kumo vekony ({thick_pct:.1f}%) -> gyenge S/R, konnyen attorheto")
+    else:
+        signals.append(f"Kumo kozepes ({thick_pct:.1f}%)")
+
+    bear_count = len(signals) - bull_count
+    if bull_count >= 4:
+        summary = "Ichimoku: EROS BULLISH"
+    elif bull_count >= 3:
+        summary = "Ichimoku: BULLISH"
+    elif bull_count >= 2:
+        summary = "Ichimoku: ENYHE BULLISH"
+    elif bear_count >= 4:
+        summary = "Ichimoku: EROS BEARISH"
+    elif bear_count >= 3:
+        summary = "Ichimoku: BEARISH"
+    else:
+        summary = "Ichimoku: SEMLEGES"
+
+    score_mod = (bull_count - 2.5) * 4  # -10 to +10
+
+    return {"score": round(score_mod), "bull": bull_count, "bear": bear_count,
+            "signals": signals, "summary": summary}
+
+
+# ============================================================================
+# BOLLINGER BANDS RESZLETES ELEMZES
+# ============================================================================
+def analyze_bollinger(df: pd.DataFrame) -> dict:
+    """Bollinger Bands reszletes elemzes: squeeze, walk, %B."""
+    if len(df) < 25 or "bb_upper" not in df or not pd.notna(df["bb_upper"].iloc[-1]):
+        return {"score": 0, "signals": [], "summary": "Nincs eleg BB adat."}
+
+    close = df["close"]
+    upper = df["bb_upper"]
+    lower = df["bb_lower"]
+    mid = df["bb_middle"]
+
+    c = close.iloc[-1]
+    u = upper.iloc[-1]
+    l = lower.iloc[-1]
+    width = u - l
+
+    signals = []
+    score_mod = 0
+
+    # %B
+    pct_b = (c - l) / (u - l) if (u - l) > 0 else 0.5
+    if pct_b > 1.0:
+        signals.append(f"BB %B = {pct_b:.2f} — ar a FELSO sav FELETT -> tulvett, short jelzes")
+        score_mod -= 10  # short bonus / long penalty
+    elif pct_b < 0.0:
+        signals.append(f"BB %B = {pct_b:.2f} — ar az ALSO sav ALATT -> tuleladott, long jelzes")
+        score_mod += 10
+    elif 0.4 <= pct_b <= 0.6:
+        signals.append(f"BB %B = {pct_b:.2f} — kozepsav, semleges")
+    else:
+        tag = "felso fele" if pct_b > 0.5 else "also fele"
+        signals.append(f"BB %B = {pct_b:.2f} — {tag}")
+
+    # Squeeze detektalas
+    if len(df) >= 25:
+        widths = (upper - lower).iloc[-25:]
+        current_width = widths.iloc[-1]
+        pct_rank = (widths < current_width).sum() / len(widths)
+        if pct_rank <= 0.2:
+            squeeze_days = 0
+            for i in range(len(widths) - 1, -1, -1):
+                if widths.iloc[i] <= widths.quantile(0.25):
+                    squeeze_days += 1
+                else:
+                    break
+            signals.append(f"BB SQUEEZE aktiv! Szalagok {squeeze_days} napja szukek "
+                           f"(legszukebb 20%) -> kitores varhato 1-5 napon belul")
+            score_mod += 5
+        elif pct_rank >= 0.8:
+            signals.append("BB SZELES — magas volatilitas, trend folytatodik")
+
+    # Bollinger Walk
+    walk_up = 0
+    walk_down = 0
+    for i in range(-min(7, len(df)), 0):
+        if close.iloc[i] >= upper.iloc[i] * 0.98:
+            walk_up += 1
+        elif close.iloc[i] <= lower.iloc[i] * 1.02:
+            walk_down += 1
+    if walk_up >= 3:
+        signals.append(f"Bollinger Walk FELFELÉ ({walk_up} nap) — eros bullish trend, "
+                       "NE shortold!")
+        score_mod += 5
+    elif walk_down >= 3:
+        signals.append(f"Bollinger Walk LEFELÉ ({walk_down} nap) — eros bearish trend, "
+                       "NE longold!")
+        score_mod -= 5
+
+    # Szelesseg trend
+    if len(df) >= 10:
+        w5 = (upper.iloc[-5:] - lower.iloc[-5:]).mean()
+        w10 = (upper.iloc[-10:-5] - lower.iloc[-10:-5]).mean()
+        if w10 > 0:
+            if w5 < w10 * 0.8:
+                signals.append("BB szukuloben -> alacsony volatilitas, kitores kozeleg")
+            elif w5 > w10 * 1.2:
+                signals.append("BB szelesedoben -> novekvo volatilitas")
+
+    summary = f"BB %B: {pct_b:.0%}"
+    if any("SQUEEZE" in s for s in signals):
+        summary += " + SQUEEZE"
+    if walk_up >= 3:
+        summary += " + Walk UP"
+    elif walk_down >= 3:
+        summary += " + Walk DOWN"
+
+    return {"score": score_mod, "pct_b": pct_b, "signals": signals, "summary": summary}
+
+
+# ============================================================================
+# ELLIOTT WAVE DETEKTALAS
+# ============================================================================
+def analyze_elliott(df: pd.DataFrame) -> dict:
+    """Elliott Wave struktura automatikus detektalas."""
+    if len(df) < 40:
+        return {"score": 0, "wave": "?", "waves": [],
+                "summary": "Nincs eleg adat Elliott elemzeshez."}
+
+    close = df["close"].values
+    from scipy.signal import argrelextrema as _are
+
+    # Lokalis csucsok es melypontok
+    order = max(5, len(df) // 15)
+    max_idx = _are(close, np.greater_equal, order=order)[0]
+    min_idx = _are(close, np.less_equal, order=order)[0]
+
+    # Extremumok idorendben
+    extrema = []
+    for i in max_idx:
+        extrema.append(("H", i, close[i]))
+    for i in min_idx:
+        extrema.append(("L", i, close[i]))
+    extrema.sort(key=lambda x: x[1])
+
+    if len(extrema) < 4:
+        return {"score": 0, "wave": "?", "waves": [],
+                "summary": "Nem talalhato elegendo extremum az EW elemzeshez."}
+
+    # Alternalo H/L sorozat epitese
+    filtered = [extrema[0]]
+    for e in extrema[1:]:
+        if e[0] != filtered[-1][0]:
+            filtered.append(e)
+        else:
+            # Ugyanolyan tipus: a magasabb H-t vagy alacsonyabb L-t tartjuk
+            if e[0] == "H" and e[2] > filtered[-1][2]:
+                filtered[-1] = e
+            elif e[0] == "L" and e[2] < filtered[-1][2]:
+                filtered[-1] = e
+
+    # Impulziv hullamok keresese (5 swing: H-L-H-L-H vagy L-H-L-H-L)
+    waves = []
+    current_wave = "?"
+    wave_details = []
+
+    # Megprobaljuk az utolso 5-7 extremumbol osszeallitani
+    if len(filtered) >= 5:
+        last5 = filtered[-5:]
+        prices = [x[2] for x in last5]
+        types = [x[0] for x in last5]
+        indices = [x[1] for x in last5]
+
+        # Emelkedo impulzus: L-H-L-H-L pattern ahol H-k emelkednek es L-k emelkednek
+        if types[0] == "L" and types[-1] == "L":
+            # Potencialis 1-2-3-4-5 (emelkedo)
+            w1_start, w1_end = prices[0], prices[1]
+            w2_end = prices[2]
+            w3_end = prices[3]
+            w4_end = prices[4] if len(prices) > 4 else close[-1]
+
+            w1_size = w1_end - w1_start
+            w3_size = w3_end - w2_end if len(prices) > 3 else 0
+            valid = True
+            reasons = []
+
+            if w1_size <= 0:
+                valid = False
+            if w2_end < w1_start:
+                valid = False
+                reasons.append("Wave 2 az Wave 1 ala ment")
+            if w3_size > 0 and w1_size > 0:
+                if w3_size < w1_size * 0.5:
+                    reasons.append("Wave 3 tul rovid")
+
+            if valid and w1_size > 0:
+                current_pos = close[-1]
+                if current_pos > w3_end:
+                    current_wave = "5"
+                elif current_pos > w2_end:
+                    current_wave = "3"
+                elif current_pos > w1_start:
+                    current_wave = "2 vagy 4"
+                else:
+                    current_wave = "A/B/C"
+
+                # Fibonacci extensions
+                w3_target = w2_end + w1_size * 1.618
+                w5_target = w4_end + w1_size * 1.0 if len(prices) > 4 else w3_end + w1_size * 0.618
+
+                for i, (t, idx, p) in enumerate(last5):
+                    wave_details.append({
+                        "num": i + 1, "type": t,
+                        "price": p, "idx": idx,
+                        "date": df.index[idx].strftime("%m-%d") if idx < len(df.index) else "?"
+                    })
+                waves = wave_details
+
+        # Csökkeno impulzus: H-L-H-L-H
+        elif types[0] == "H" and types[-1] == "H":
+            w1_start, w1_end = prices[0], prices[1]
+            w1_size = w1_start - w1_end  # Lefele
+            if w1_size > 0:
+                current_wave = "bearish_impulse"
+                for i, (t, idx, p) in enumerate(last5):
+                    wave_details.append({
+                        "num": i + 1, "type": t,
+                        "price": p, "idx": idx,
+                        "date": df.index[idx].strftime("%m-%d") if idx < len(df.index) else "?"
+                    })
+                waves = wave_details
+
+    # Score modosito
+    score_mod = 0
+    if current_wave == "3":
+        score_mod = 10
+    elif current_wave == "5":
+        score_mod = -5
+    elif current_wave in ("A/B/C", "bearish_impulse"):
+        score_mod = -10
+    elif current_wave == "2 vagy 4":
+        score_mod = 5
+
+    # Summary szoveg
+    if current_wave == "?":
+        summary = ("Az Elliott Wave struktura nem egyertelmu — az elmult idoszak "
+                   "mozgasa nem mutat tiszta 5 hullamod mintat. Ez altalaban "
+                   "oldalazó, range-bound piacra utal.")
+    elif current_wave == "3":
+        summary = "Elliott: az ar a WAVE 3-ban mozog — ez a legerosebb hullam."
+    elif current_wave == "5":
+        summary = "Elliott: az ar a WAVE 5-ben — az utolso hullam, csucs kozel lehet."
+    elif current_wave == "2 vagy 4":
+        summary = "Elliott: korrekcios hullam (Wave 2/4) — potencialis belepesi pont."
+    elif current_wave == "bearish_impulse":
+        summary = "Elliott: bearish impulzus — lefelemozgas dominansabb."
+    elif current_wave == "A/B/C":
+        summary = "Elliott: korrekcios A/B/C struktura — bearish retrace."
+    else:
+        summary = f"Elliott: Wave {current_wave}"
+
+    return {"score": score_mod, "wave": current_wave, "waves": waves,
+            "summary": summary}
+
+
+# ============================================================================
+# KONVERGENCIA ALERT
+# ============================================================================
+def analyze_convergence(ichi: dict, bb: dict, ew: dict, mtf: dict | None) -> dict:
+    """Kombinalt jelzes — hany rendszer egyezik."""
+    bull = 0
+    bear = 0
+    details = []
+
+    # Ichimoku
+    if ichi.get("bull", 0) >= 3:
+        bull += 1
+        details.append(f"Ichimoku: {ichi['bull']}/5 bullish")
+    elif ichi.get("bear", 0) >= 3:
+        bear += 1
+        details.append(f"Ichimoku: {ichi.get('bear',0)}/5 bearish")
+
+    # Bollinger
+    bb_pct = bb.get("pct_b", 0.5)
+    if bb_pct > 0.8:
+        bear += 1
+        details.append(f"Bollinger: %B {bb_pct:.0%} (tulvett zona)")
+    elif bb_pct < 0.2:
+        bull += 1
+        details.append(f"Bollinger: %B {bb_pct:.0%} (tuleladott zona)")
+    if any("SQUEEZE" in s for s in bb.get("signals", [])):
+        details.append("Bollinger: SQUEEZE aktiv")
+
+    # Elliott
+    ew_wave = ew.get("wave", "?")
+    if ew_wave in ("3",):
+        bull += 1
+        details.append(f"Elliott: Wave {ew_wave} (bullish)")
+    elif ew_wave in ("5", "A/B/C", "bearish_impulse"):
+        bear += 1
+        details.append(f"Elliott: Wave {ew_wave} (bearish)")
+
+    # MTF
+    if mtf:
+        if mtf.get("bull_count", 0) >= 3:
+            bull += 1
+            details.append(f"MTF: {mtf['bull_count']}/4 bullish")
+        elif mtf.get("bear_count", 0) >= 3:
+            bear += 1
+            details.append(f"MTF: {mtf['bear_count']}/4 bearish")
+
+    total = max(bull, bear)
+    if total >= 3:
+        signal = "KONVERGENCIA BULLISH" if bull > bear else "KONVERGENCIA BEARISH"
+        score_mod = 15 if bull > bear else -15
+    elif total == 2:
+        signal = "RESZLEGES egyezes"
+        score_mod = 5 if bull > bear else -5
+    else:
+        signal = "VEGYES — ne kereskedj"
+        score_mod = 0
+
+    return {
+        "bull": bull, "bear": bear, "total": total,
+        "signal": signal, "score": score_mod, "details": details,
+    }
+
+
 def _wrap(text: str, width: int = 68, indent: str = "  ") -> str:
     """Szoveg sorokra tordelese."""
     words = text.split()
@@ -1444,6 +1845,19 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     pos = _position_size(10000, close, atr, levels["risk"], vol_24h)
     large_candles = _detect_large_candles(df)
 
+    # Advanced modules
+    ichi_analysis = analyze_ichimoku(df)
+    bb_analysis = analyze_bollinger(df)
+    ew_analysis = analyze_elliott(df)
+    conv_analysis = analyze_convergence(ichi_analysis, bb_analysis, ew_analysis, mtf_result)
+
+    # Apply advanced score modifiers
+    adv_mod = ichi_analysis["score"] + bb_analysis["score"] + ew_analysis["score"] + conv_analysis["score"]
+    score = max(0, min(100, score + adv_mod))
+    labels_r = [(80, "Eros vetel"), (60, "Gyenge vetel"), (40, "Semleges"),
+                (20, "Gyenge eladas"), (0, "Eros eladas")]
+    rec = next(lb for th, lb in labels_r if score >= th)
+
     W = 70
     B = Fore.CYAN + Style.BRIGHT
     G = Fore.GREEN + Style.BRIGHT
@@ -1527,6 +1941,38 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     print(f"{'-' * W}")
     print(_build_detailed_scenarios(df, close, sr_levels, atr,
                                      last.get("adx", 0), rsi, mtf_result, fib))
+
+    # ---- ICHIMOKU RESZLETES ----
+    print(f"\n{M} ICHIMOKU FELHO ELEMZES ({ichi_analysis['summary']}){D}")
+    print(f"{'-' * W}")
+    for sig in ichi_analysis["signals"]:
+        print(f"  {sig}")
+
+    # ---- BOLLINGER RESZLETES ----
+    print(f"\n{M} BOLLINGER BANDS ELEMZES ({bb_analysis['summary']}){D}")
+    print(f"{'-' * W}")
+    for sig in bb_analysis["signals"]:
+        print(f"  {sig}")
+
+    # ---- ELLIOTT WAVE ----
+    print(f"\n{M} ELLIOTT WAVE ({ew_analysis['summary']}){D}")
+    print(f"{'-' * W}")
+    if ew_analysis["waves"]:
+        for w in ew_analysis["waves"]:
+            print(f"  Wave {w['num']} ({w['type']}): {_P(w['price'])} [{w['date']}]")
+    else:
+        print(f"  {ew_analysis['summary']}")
+
+    # ---- KONVERGENCIA ----
+    conv_sig = conv_analysis["signal"]
+    conv_color = G if "BULL" in conv_sig else (R if "BEAR" in conv_sig else Y)
+    print(f"\n{M} KONVERGENCIA ALERT: {conv_color}{conv_sig}{D}")
+    print(f"{'-' * W}")
+    for d in conv_analysis["details"]:
+        print(f"  {d}")
+    print(f"  -> {conv_analysis['bull']}/4 bullish | {conv_analysis['bear']}/4 bearish")
+    if conv_analysis["total"] >= 3:
+        print(f"  {conv_color}=> NAGYON EROS JELZES — {conv_analysis['total']}/4 rendszer egyezik!{D}")
 
     # ---- WHALE / SMART MONEY ----
     print(f"\n{M} WHALE / SMART MONEY{D}")
