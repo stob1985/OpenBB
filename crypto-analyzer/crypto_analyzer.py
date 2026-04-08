@@ -21,6 +21,8 @@ Hasznalat:
     python crypto_analyzer.py --source binance --symbols BTCUSDT,ETHUSDT,SOLUSDT
     python crypto_analyzer.py --source binance --symbol BTC-USD --interval 4h
     python crypto_analyzer.py --source binance --scan-binance --days 180
+    python crypto_analyzer.py --source alpha --symbol PLAY --days 90
+    python crypto_analyzer.py --source alpha --symbols PLAY,ONDO,VIRTUAL
 """
 
 import argparse
@@ -35,6 +37,159 @@ import requests
 from scipy.signal import argrelextrema
 
 BINANCE_BASE_URL = "https://api.binance.us/api/v3"
+GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
+
+# Binance Alpha token cache (lazyload)
+_alpha_token_cache = None
+
+
+def _load_alpha_tokens() -> list[dict]:
+    """Binance Alpha token lista betoltese (cached)."""
+    global _alpha_token_cache
+    if _alpha_token_cache is not None:
+        return _alpha_token_cache
+    url = "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    _alpha_token_cache = data.get("data", []) if data.get("success") else []
+    return _alpha_token_cache
+
+
+def _find_alpha_token(symbol: str) -> dict | None:
+    """Binance Alpha token kereses szimbolum alapjan."""
+    sym = symbol.upper().replace("-USD", "").replace("-USDT", "").replace("/", "")
+    tokens = _load_alpha_tokens()
+    # Pontos egyezes (largest marketcap first)
+    matches = [t for t in tokens if t.get("symbol", "").upper() == sym]
+    if matches:
+        matches.sort(key=lambda t: float(t.get("marketCap") or 0), reverse=True)
+        return matches[0]
+    return None
+
+
+# chain ID -> GeckoTerminal network slug
+_CHAIN_MAP = {
+    "1": "eth", "56": "bsc", "137": "polygon_pos", "8453": "base",
+    "42161": "arbitrum", "10": "optimism", "43114": "avax",
+    "CT_501": "solana",
+}
+
+
+def _get_gecko_network(chain_id) -> str:
+    return _CHAIN_MAP.get(str(chain_id), "eth")
+
+
+def fetch_alpha_data(symbol: str, days: int = 180, interval: str = "1d") -> pd.DataFrame:
+    """Binance Alpha token adatok GeckoTerminal OHLCV API-n keresztul."""
+    token_info = _find_alpha_token(symbol)
+    if not token_info:
+        raise ValueError(f"Binance Alpha token nem talalhato: {symbol}")
+
+    contract = token_info["contractAddress"]
+    chain_id = token_info.get("chainId", "8453")
+    network = _get_gecko_network(chain_id)
+    name = token_info.get("name", symbol)
+    price = token_info.get("price", "?")
+
+    print(f"  Adatok lekerese (Binance Alpha / GeckoTerminal):")
+    print(f"    Token: {token_info.get('symbol')} ({name})")
+    print(f"    Chain: {network} | Contract: {contract[:10]}...{contract[-6:]}")
+    print(f"    Aktualis ar: ${float(price):,.6g}" if price else "")
+
+    # DexScreener-ról megkeressük a pool cimet
+    dex_resp = requests.get(
+        f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=15)
+    dex_data = dex_resp.json()
+    pairs = dex_data.get("pairs", [])
+    if not pairs:
+        raise ValueError(f"Nem talalhato DEX par: {symbol} ({contract})")
+
+    # Legnagyobb volume-u par kivalasztasa
+    pairs.sort(key=lambda p: float(p.get("volume", {}).get("h24", 0) or 0), reverse=True)
+    best_pair = pairs[0]
+    pool_addr = best_pair.get("pairAddress", "")
+    pair_chain = best_pair.get("chainId", network)
+    dex_name = best_pair.get("dexId", "?")
+
+    print(f"    DEX: {dex_name} | Pool: {pool_addr[:10]}...{pool_addr[-6:]}")
+
+    # GeckoTerminal OHLCV
+    gt_timeframe = {"1d": "day", "1h": "hour", "4h": "hour", "1w": "day"}.get(interval, "day")
+    gt_aggregate = {"4h": 4, "1w": 7}.get(interval, 1)
+
+    all_ohlcv = []
+    page_token = None
+    needed = days if gt_timeframe == "day" else days * (24 // gt_aggregate if gt_timeframe == "hour" else 1)
+
+    while len(all_ohlcv) < needed:
+        limit = min(1000, needed - len(all_ohlcv))
+        gt_url = (f"{GECKOTERMINAL_BASE}/networks/{pair_chain}/pools/{pool_addr}"
+                  f"/ohlcv/{gt_timeframe}")
+        params = {"aggregate": gt_aggregate, "limit": limit, "currency": "usd"}
+        if page_token:
+            params["before_timestamp"] = page_token
+        gr = requests.get(gt_url, timeout=15)
+        if gr.status_code != 200:
+            break
+        gd = gr.json()
+        ohlcv_list = gd.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        if not ohlcv_list:
+            break
+        all_ohlcv.extend(ohlcv_list)
+        page_token = ohlcv_list[-1][0]
+        if len(ohlcv_list) < limit:
+            break
+
+    if not all_ohlcv:
+        raise ValueError(f"Nincs OHLCV adat: {symbol}")
+
+    # Forditott sorrend (legrégebbi elol)
+    all_ohlcv.sort(key=lambda x: x[0])
+
+    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["date"] = pd.to_datetime(df["timestamp"], unit="s")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df = df.set_index("date")[["open", "high", "low", "close", "volume"]]
+    df = df[~df.index.duplicated(keep="last")]
+
+    print(f"    Betoltve: {len(df)} {gt_timeframe} gyertya ({df.index[0].date()} -> {df.index[-1].date()})")
+    return df
+
+
+def fetch_alpha_ticker(symbol: str) -> dict | None:
+    """Binance Alpha token 24h adatok DexScreener-ról."""
+    token_info = _find_alpha_token(symbol)
+    if not token_info:
+        return None
+    contract = token_info["contractAddress"]
+    dex_resp = requests.get(
+        f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=15)
+    pairs = dex_resp.json().get("pairs", [])
+    if not pairs:
+        return None
+    pairs.sort(key=lambda p: float(p.get("volume", {}).get("h24", 0) or 0), reverse=True)
+    p = pairs[0]
+    price = float(p.get("priceUsd", 0) or 0)
+    return {
+        "symbol": token_info.get("symbol"),
+        "display": f"{token_info.get('symbol')}/USDC (Binance Alpha)",
+        "price": price,
+        "change_pct": float(p.get("priceChange", {}).get("h24", 0) or 0),
+        "high_24h": price,  # DexScreener nem ad high/low-t
+        "low_24h": price,
+        "volume_24h": float(p.get("volume", {}).get("h24", 0) or 0),
+        "quote_volume_24h": float(p.get("volume", {}).get("h24", 0) or 0),
+        "bid": price,
+        "ask": price,
+        "trades_24h": int(p.get("txns", {}).get("h24", {}).get("buys", 0) or 0)
+                     + int(p.get("txns", {}).get("h24", {}).get("sells", 0) or 0),
+        "liquidity": float(p.get("liquidity", {}).get("usd", 0) or 0),
+        "dex": p.get("dexId", "?"),
+        "chain": p.get("chainId", "?"),
+        "market_cap": float(token_info.get("marketCap", 0) or 0),
+    }
 
 
 # ============================================================================
@@ -179,6 +334,8 @@ def fetch_crypto_data(
     quote: str = "USDT",
 ) -> pd.DataFrame:
     """Adatlekerdezes source-tol fuggoen."""
+    if source == "alpha":
+        return fetch_alpha_data(symbol, days, interval)
     if source == "binance":
         return fetch_binance_data(symbol, days, interval, quote)
     # OpenBB
@@ -639,6 +796,12 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         print(f"    Trades 24h:       {binance_extra['trades_24h']:,}")
         if binance_extra.get("funding_rate") is not None:
             print(f"    Funding Rate:     {binance_extra['funding_rate'] * 100:.4f}%")
+        if binance_extra.get("liquidity"):
+            print(f"    Liquidity:        ${binance_extra['liquidity']:,.0f}")
+        if binance_extra.get("dex"):
+            print(f"    DEX/Chain:        {binance_extra['dex']} / {binance_extra.get('chain', '?')}")
+        if binance_extra.get("market_cap"):
+            print(f"    Market Cap:       ${binance_extra['market_cap']:,.0f}")
 
     print("-" * 70)
     print(f"  SMA 20/50/200:      ${last['sma_20']:,.4g} / ${last['sma_50']:,.4g}", end="")
@@ -686,12 +849,17 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
             df = fetch_crypto_data(sym, days, source, provider, interval, quote)
             df = add_all_indicators(df)
             sr = get_sr_levels(df)
-            # Binance extra adatok
+            # Extra adatok forrastol fuggoen
             binance_extra = None
             if source == "binance":
                 try:
                     binance_extra = fetch_binance_ticker_24h(sym, quote)
                     binance_extra["funding_rate"] = fetch_binance_funding_rate(sym, quote)
+                except Exception:
+                    pass
+            elif source == "alpha":
+                try:
+                    binance_extra = fetch_alpha_ticker(sym)
                 except Exception:
                     pass
             info = print_summary(df, sym, sr, binance_extra)
@@ -747,8 +915,8 @@ def main() -> None:
                         help="Tobb coin vesszoval: BTC-USD,ETH-USD vagy BTCUSDT,ETHUSDT")
     parser.add_argument("--days", type=int, default=180,
                         help="Visszatekintesi idoszak napokban (alapert: 180)")
-    parser.add_argument("--source", default="openbb", choices=["openbb", "binance"],
-                        help="Adatforras: openbb (default) vagy binance")
+    parser.add_argument("--source", default="openbb", choices=["openbb", "binance", "alpha"],
+                        help="Adatforras: openbb (default), binance, alpha (Binance Alpha/DEX)")
     parser.add_argument("--provider", default="yfinance",
                         help="OpenBB provider (yfinance, fmp, tiingo)")
     parser.add_argument("--interval", default="1d",
@@ -767,7 +935,7 @@ def main() -> None:
 
     print(f"\nCrypto Swing Trading Analyzer")
     print(f"Idoszak: {args.days} nap | Forras: {source}"
-          + (f" | Interval: {args.interval}" if source == "binance" else
+          + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
 
     if args.scan_binance:
@@ -779,7 +947,8 @@ def main() -> None:
     elif args.symbol:
         coin_list = [args.symbol]
     else:
-        coin_list = ["BTC-USD"] if source == "openbb" else ["BTCUSDT"]
+        defaults = {"openbb": "BTC-USD", "binance": "BTCUSDT", "alpha": "PLAY"}
+        coin_list = [defaults.get(source, "BTC-USD")]
 
     print(f"Coinok: {', '.join(coin_list)}\n")
     run_scanner(coin_list, args.days, source, args.provider,
