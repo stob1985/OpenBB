@@ -554,48 +554,157 @@ def detect_golden_death_cross(df: pd.DataFrame) -> str:
 
 
 # ============================================================================
-# 6. SCORING RENDSZER
+# 6. SCORING RENDSZER + PUMP PENALTY
 # ============================================================================
+def calc_pump_penalty(df: pd.DataFrame) -> tuple[float, list[str]]:
+    """Pump & dump szuro: penalty pontok es indokok."""
+    penalty = 0.0
+    flags = []
+    close = df["close"]
+    vol = df["volume"].fillna(0)
+
+    # 1. Egynapos nagy mozgas (utolso 5 nap)
+    max_daily_move = 0
+    for i in range(-min(5, len(df) - 1), 0):
+        prev_c = df["close"].iloc[i - 1]
+        if prev_c > 0:
+            move = abs(df["close"].iloc[i] - prev_c) / prev_c
+            max_daily_move = max(max_daily_move, move)
+    if max_daily_move > 0.30:
+        penalty += 30
+        flags.append(f"1 napos mozgas {max_daily_move:.0%}")
+    elif max_daily_move > 0.20:
+        penalty += 20
+        flags.append(f"1 napos mozgas {max_daily_move:.0%}")
+
+    # 2. ATR volatilitas
+    if len(df) >= 15:
+        h, l, c = df["high"], df["low"], df["close"]
+        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        atr_pct = float(tr.rolling(14).mean().iloc[-1] / close.iloc[-1] * 100)
+        if atr_pct > 15:
+            penalty += 20
+            flags.append(f"ATR {atr_pct:.0f}% extrem")
+        elif atr_pct > 10:
+            penalty += 10
+            flags.append(f"ATR {atr_pct:.0f}% magas")
+
+    # 3. 7 napos emelkedes >50%
+    if len(close) >= 8:
+        week_change = (close.iloc[-1] - close.iloc[-8]) / close.iloc[-8]
+        if week_change > 0.50:
+            penalty += 25
+            flags.append(f"7 nap +{week_change:.0%}")
+
+    # 4. 90 napos max drawdown > -50%
+    n90 = min(90, len(df))
+    if n90 >= 10:
+        peak = close.iloc[-n90:].cummax()
+        dd = ((close.iloc[-n90:] - peak) / peak).min()
+        if dd < -0.50:
+            penalty += 15
+            flags.append(f"90d DD {dd:.0%}")
+
+    # 5. Volume spike >10x (utolso 3 nap)
+    if len(vol) >= 21:
+        avg_vol = vol.iloc[-21:-3].mean()
+        if avg_vol > 0:
+            recent_max_vol = vol.iloc[-3:].max()
+            vol_spike = recent_max_vol / avg_vol
+            if vol_spike > 10:
+                penalty += 20
+                flags.append(f"Vol spike {vol_spike:.0f}x")
+
+    # 6. Penny coin
+    if close.iloc[-1] < 0.01:
+        penalty += 10
+        flags.append("Penny coin")
+
+    # 7. Organikus trend teszt (20 nap napi hozam szoras)
+    if len(close) >= 21:
+        daily_returns = close.pct_change().iloc[-20:]
+        std_pct = float(daily_returns.std() * 100)
+        if std_pct > 10:
+            penalty += 15
+            flags.append(f"Szoras {std_pct:.1f}% instabil")
+
+    # 8. Minimum trend-kor (SMA20 felett/alatt hany napja)
+    sma20 = df.get("sma_20")
+    if sma20 is not None and sma20.notna().any():
+        above = close > sma20
+        trend_days = 0
+        for i in range(len(above) - 1, -1, -1):
+            if above.iloc[i] == above.iloc[-1]:
+                trend_days += 1
+            else:
+                break
+        if trend_days < 5:
+            flags.append(f"Trend {trend_days} napos (friss)")
+            # Nem penalty, de a trend-pontokat felezzuk (jelzes a callernek)
+
+    return penalty, flags
+
+
 def calc_swing_score(df: pd.DataFrame, sr_levels: list) -> tuple:
     last = df.iloc[-1]
-    score = 50.0
+    raw_score = 50.0
     adx_val = last.get("adx", 0)
     plus_di = last.get("plus_di", 0)
     minus_di = last.get("minus_di", 0)
+
+    # Trend-kor check (SMA20 felett hany napja)
+    sma20 = df.get("sma_20")
+    trend_mult = 1.0
+    if sma20 is not None and sma20.notna().any():
+        above = df["close"] > sma20
+        trend_days = 0
+        for i in range(len(above) - 1, -1, -1):
+            if above.iloc[i] == above.iloc[-1]:
+                trend_days += 1
+            else:
+                break
+        if trend_days < 5:
+            trend_mult = 0.5
+
     if adx_val > 25:
-        ts = min(adx_val, 50) / 50 * 20
-        score += ts if plus_di > minus_di else -ts
+        ts = min(adx_val, 50) / 50 * 20 * trend_mult
+        raw_score += ts if plus_di > minus_di else -ts
     rsi_val = last.get("rsi", 50)
     if rsi_val < 30:
-        score += 15 * (30 - rsi_val) / 30
+        raw_score += 15 * (30 - rsi_val) / 30
     elif rsi_val > 70:
-        score -= 15 * (rsi_val - 70) / 30
+        raw_score -= 15 * (rsi_val - 70) / 30
     macd_val = last.get("macd", 0)
     macd_sig = last.get("macd_signal", 0)
     diff = abs(macd_val - macd_sig)
     contribution = min(15, 15 * diff / (abs(macd_sig) + 1e-9))
-    score += contribution if macd_val > macd_sig else -contribution
+    raw_score += contribution if macd_val > macd_sig else -contribution
     vol = df["volume"].fillna(0)
     if len(vol) >= 21:
         avg = vol.iloc[-21:-1].mean()
         vr = vol.iloc[-1] / avg if avg > 0 else 1
         if vr > 1.5:
-            score += 10 * min(vr - 1, 1)
+            raw_score += 10 * min(vr - 1, 1)
         elif vr < 0.5:
-            score -= 5
+            raw_score -= 5
     close = last["close"]
     if sr_levels:
         ns = max([l for l in sr_levels if l <= close], default=None)
         nr = min([l for l in sr_levels if l > close], default=None)
         if ns and (close - ns) / close < 0.02:
-            score += 10
+            raw_score += 10
         if nr and (nr - close) / close < 0.02:
-            score -= 10
-    score = max(0, min(100, score))
+            raw_score -= 10
+    raw_score = max(0, min(100, raw_score))
+
+    # Pump penalty
+    penalty, pump_flags = calc_pump_penalty(df)
+    final_score = max(0, min(100, raw_score - penalty))
+
     labels = [(80, "Eros vetel"), (60, "Gyenge vetel"), (40, "Semleges"),
               (20, "Gyenge eladas"), (0, "Eros eladas")]
-    rec = next(lb for th, lb in labels if score >= th)
-    return round(score, 1), rec
+    rec = next(lb for th, lb in labels if final_score >= th)
+    return round(final_score, 1), rec, round(raw_score, 1), round(penalty, 1), pump_flags
 
 
 # ============================================================================
@@ -984,7 +1093,7 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     close = last["close"]
     rsi = last.get("rsi", 50)
     chg = ((close / prev["close"]) - 1) * 100
-    score, rec = calc_swing_score(df, sr_levels)
+    score, rec, raw_score, penalty, pump_flags = calc_swing_score(df, sr_levels)
     alerts = generate_alerts(df, sr_levels)
     fib = calc_fibonacci_retracement(df)
     atr = _calc_atr(df) if len(df) >= 15 else abs(last["high"] - last["low"])
@@ -1011,8 +1120,14 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     print(f" AKCIO TERV: {symbol}")
     print(f"{'=' * W}{D}")
 
+    pump_warn = penalty >= 20
     action_icon = G + "VETEL" if score >= 60 else (R + "ELADAS" if score < 40 else Y + "VARJ")
-    print(f" {action_icon}{D} | Score: {score_color}{score}/100 ({rec}){D}")
+    if pump_warn:
+        action_icon = R + "PUMP GYANU"
+    score_str = f"{score}/100"
+    if penalty > 0:
+        score_str += f" (nyers: {raw_score}, penalty: -{penalty})"
+    print(f" {action_icon}{D} | Score: {score_color}{score_str}{D} ({rec})")
     print(f" {timing}")
     if levels["nearest_support"]:
         print(f"   Belepes: {G}{_P(levels['entry'])}{D} zona")
@@ -1124,6 +1239,15 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     print(f"{'-' * W}")
     print(f"  {Y}{timing}{D}")
 
+    # ---- PUMP SZURO ----
+    if pump_flags:
+        print(f"\n{R} PUMP & DUMP SZURO (penalty: -{penalty}){D}")
+        print(f"{'-' * W}")
+        for f in pump_flags:
+            print(f"  {R}>>{D} {f}")
+        if pump_warn:
+            print(f"  {R}FIGYELEM: Magas pump kockazat! A score {raw_score} -> {score} csokkenve.{D}")
+
     # ---- ALERTS ----
     if alerts:
         print(f"\n{M} RIASZTASOK ({len(alerts)}){D}")
@@ -1136,7 +1260,9 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     return {
         "symbol": symbol, "close": close, "change_pct": chg,
         "rsi": rsi, "adx": last.get("adx", 0), "macd": last.get("macd", 0),
-        "score": score, "rec": rec, "alerts": len(alerts),
+        "score": score, "raw_score": raw_score, "penalty": penalty,
+        "rec": rec, "alerts": len(alerts),
+        "pump_warn": pump_warn,
     }
 
 
@@ -1167,7 +1293,7 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                 except Exception:
                     pass
             # Ellenorizzuk a score-t elore
-            score, _ = calc_swing_score(df, sr)
+            score, rec_label, raw_s, pen, pflags = calc_swing_score(df, sr)
             if detail_threshold > 0 and score < detail_threshold:
                 # Csak tablazatba kerul, nincs reszletes elemzes
                 last = df.iloc[-1]
@@ -1176,7 +1302,9 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                     "symbol": sym, "close": last["close"], "change_pct": chg,
                     "rsi": last.get("rsi", 50), "adx": last.get("adx", 0),
                     "macd": last.get("macd", 0), "score": score,
-                    "rec": _, "alerts": len(generate_alerts(df, sr)),
+                    "raw_score": raw_s, "penalty": pen,
+                    "rec": rec_label, "alerts": len(generate_alerts(df, sr)),
+                    "pump_warn": pen >= 20,
                 })
                 continue
             info = print_summary(df, sym, sr, binance_extra)
@@ -1187,13 +1315,18 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
 
     if len(results) > 1:
         results.sort(key=lambda x: x["score"], reverse=True)
-        print("\n\n" + "=" * 90)
+        W2 = 105
+        print("\n\n" + "=" * W2)
         print("  MULTI-COIN SCANNER OSSZEFOGLALO (rendezve swing score szerint)")
-        print("=" * 90)
-        hdr = f"  {'Coin':<14}{'Ar':>14}{'Valt%':>8}{'RSI':>7}{'ADX':>7}{'MACD':>12}{'Score':>8}  {'Jelzes':<14}{'Alert':>6}"
+        print("=" * W2)
+        hdr = f"  {'Coin':<14}{'Ar':>14}{'Valt%':>8}{'RSI':>7}{'ADX':>7}{'MACD':>12}{'Score':>10}{'Pen':>5}  {'Jelzes':<14}{'Flag':>6}"
         print(hdr)
-        print("-" * 90)
+        print("-" * W2)
         for r in results:
+            pen = r.get("penalty", 0)
+            pw = r.get("pump_warn", False)
+            flag_str = "PUMP!" if pw else ""
+            pen_str = f"-{pen:.0f}" if pen > 0 else ""
             print(
                 f"  {r['symbol']:<14}"
                 f"${r['close']:>12,.4g}"
@@ -1202,10 +1335,11 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                 f"{r['adx']:>7.1f}"
                 f"{r['macd']:>+12.4g}"
                 f"{r['score']:>7.1f}"
+                f"{pen_str:>5}"
                 f"  {r['rec']:<14}"
-                f"{r['alerts']:>4}"
+                f"{flag_str:>5}"
             )
-        print("=" * 90)
+        print("=" * W2)
 
 
 def run_binance_scan(days: int, interval: str, quote: str,
@@ -1384,7 +1518,15 @@ def calc_short_score(df: pd.DataFrame, sr_levels: list,
     if divs["vol_div"] and "Vol. divergencia" not in " ".join(reasons):
         score += 5
 
-    return min(score, 100), reasons
+    raw_score = min(score, 100)
+
+    # Pump penalty a short score-ra is (extrem volatilitas nem megbizhato)
+    penalty, pflags = calc_pump_penalty(df)
+    # Short-nal felezzuk a penalty-t (a volatilitas reszben jo shorthoz)
+    short_penalty = penalty * 0.5
+    final = max(0, min(100, raw_score - short_penalty))
+
+    return final, reasons, raw_score, short_penalty, pflags
 
 
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "2L", "2S")
@@ -1532,7 +1674,7 @@ def run_short_scanner(days: int, interval: str, quote: str,
             # Funding rate (proba, nem szamit bele a rate limitbe)
             fr = fetch_binance_funding_rate(sym, quote)
 
-            short_score, reasons = calc_short_score(df, sr, fr)
+            short_score, reasons, raw_ss, ss_pen, ss_pflags = calc_short_score(df, sr, fr)
 
             if short_score >= min_score:
                 last = df.iloc[-1]
