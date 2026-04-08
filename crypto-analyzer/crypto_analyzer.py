@@ -1087,13 +1087,21 @@ def _position_size(portfolio: float, close: float, atr: float, stop_dist: float,
 
 
 def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
-                  binance_extra: dict | None = None) -> dict:
+                  binance_extra: dict | None = None,
+                  mtf_result: dict | None = None) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
     close = last["close"]
     rsi = last.get("rsi", 50)
     chg = ((close / prev["close"]) - 1) * 100
     score, rec, raw_score, penalty, pump_flags = calc_swing_score(df, sr_levels)
+    mtf_mod = 0
+    if mtf_result:
+        mtf_mod = mtf_score_modifier(mtf_result)
+        score = max(0, min(100, score + mtf_mod))
+        labels = [(80, "Eros vetel"), (60, "Gyenge vetel"), (40, "Semleges"),
+                  (20, "Gyenge eladas"), (0, "Eros eladas")]
+        rec = next(lb for th, lb in labels if score >= th)
     alerts = generate_alerts(df, sr_levels)
     fib = calc_fibonacci_retracement(df)
     atr = _calc_atr(df) if len(df) >= 15 else abs(last["high"] - last["low"])
@@ -1125,8 +1133,13 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
     if pump_warn:
         action_icon = R + "PUMP GYANU"
     score_str = f"{score}/100"
+    parts = []
     if penalty > 0:
-        score_str += f" (nyers: {raw_score}, penalty: -{penalty})"
+        parts.append(f"penalty: -{penalty}")
+    if mtf_mod != 0:
+        parts.append(f"MTF: {mtf_mod:+d}")
+    if parts:
+        score_str += f" (nyers: {raw_score}, {', '.join(parts)})"
     print(f" {action_icon}{D} | Score: {score_color}{score_str}{D} ({rec})")
     print(f" {timing}")
     if levels["nearest_support"]:
@@ -1248,6 +1261,10 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         if pump_warn:
             print(f"  {R}FIGYELEM: Magas pump kockazat! A score {raw_score} -> {score} csokkenve.{D}")
 
+    # ---- MTF ----
+    if mtf_result:
+        print_mtf_table(symbol, mtf_result)
+
     # ---- ALERTS ----
     if alerts:
         print(f"\n{M} RIASZTASOK ({len(alerts)}){D}")
@@ -1271,7 +1288,7 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
 # ============================================================================
 def run_scanner(symbols: list, days: int, source: str, provider: str,
                 interval: str, quote: str,
-                detail_threshold: float = 0) -> None:
+                detail_threshold: float = 0, use_mtf: bool = False) -> None:
     """detail_threshold: csak ez feletti score-nal ad reszletes elemzest + chartot."""
     results = []
     for sym in symbols:
@@ -1292,22 +1309,35 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                     binance_extra = fetch_alpha_ticker(sym)
                 except Exception:
                     pass
+            # MTF
+            mtf = None
+            if use_mtf and source == "binance":
+                try:
+                    mtf = calc_mtf(sym, quote)
+                except Exception:
+                    pass
             # Ellenorizzuk a score-t elore
             score, rec_label, raw_s, pen, pflags = calc_swing_score(df, sr)
+            if mtf:
+                score = max(0, min(100, score + mtf_score_modifier(mtf)))
             if detail_threshold > 0 and score < detail_threshold:
-                # Csak tablazatba kerul, nincs reszletes elemzes
                 last = df.iloc[-1]
                 chg = ((last["close"] / df.iloc[-2]["close"]) - 1) * 100
+                mtf_str = ""
+                if mtf:
+                    mtf_str = f"{mtf['bull_count']}/4"
                 results.append({
                     "symbol": sym, "close": last["close"], "change_pct": chg,
                     "rsi": last.get("rsi", 50), "adx": last.get("adx", 0),
                     "macd": last.get("macd", 0), "score": score,
                     "raw_score": raw_s, "penalty": pen,
                     "rec": rec_label, "alerts": len(generate_alerts(df, sr)),
-                    "pump_warn": pen >= 20,
+                    "pump_warn": pen >= 20, "mtf": mtf_str,
                 })
                 continue
-            info = print_summary(df, sym, sr, binance_extra)
+            info = print_summary(df, sym, sr, binance_extra, mtf_result=mtf)
+            if mtf:
+                info["mtf"] = f"{mtf['bull_count']}/4"
             plot_chart(df, sym, sr)
             results.append(info)
         except Exception as e:
@@ -1343,7 +1373,8 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
 
 
 def run_binance_scan(days: int, interval: str, quote: str,
-                     min_volume: float, detail_threshold: float = 0) -> None:
+                     min_volume: float, detail_threshold: float = 0,
+                     use_mtf: bool = False) -> None:
     """Binance top 50 par scan es elemzes."""
     print(f"\n  Binance Scanner: top 50 {quote} par lekerese (min vol: ${min_volume:,.0f})...")
     top_symbols = scan_binance_top_pairs(quote, min_volume)
@@ -1352,7 +1383,7 @@ def run_binance_scan(days: int, interval: str, quote: str,
         print("  Nincs elegendo par a szuresnek megfelelo.")
         return
     run_scanner(top_symbols, days, "binance", "yfinance", interval, quote,
-                detail_threshold=detail_threshold)
+                detail_threshold=detail_threshold, use_mtf=use_mtf)
 
 
 # ============================================================================
@@ -1814,8 +1845,210 @@ def run_short_scanner(days: int, interval: str, quote: str,
 
 
 
+
+
 # ============================================================================
-# 14. BACKTESTING MOTOR
+# 14. MULTI-TIMEFRAME (MTF) MOTOR
+# ============================================================================
+_mtf_cache = {}
+_mtf_cache_time = {}
+
+MTF_INTERVALS = [
+    ("1h", 168),   # 1 het
+    ("4h", 180),   # 30 nap
+    ("1d", 200),   # 200 nap
+    ("1w", 104),   # 2 ev
+]
+
+
+def _fetch_mtf_data(symbol: str, quote: str = "USDT") -> dict:
+    """Minden timeframe-re lekeri az OHLCV adatot (cached 15 perc)."""
+    import time as _time
+    bn_symbol = _symbol_to_binance(symbol, quote)
+    now = datetime.now()
+    cache_key = bn_symbol
+
+    if (cache_key in _mtf_cache and cache_key in _mtf_cache_time and
+            (now - _mtf_cache_time[cache_key]).total_seconds() < 900):
+        return _mtf_cache[cache_key]
+
+    result = {}
+    for interval, limit in MTF_INTERVALS:
+        try:
+            params = {"symbol": bn_symbol, "interval": interval, "limit": limit}
+            resp = requests.get(f"{BINANCE_BASE_URL}/klines", params=params, timeout=15)
+            resp.raise_for_status()
+            rows = resp.json()
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_volume", "trades", "taker_buy_vol",
+                "taker_buy_quote_vol", "ignore",
+            ])
+            df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            df = df.set_index("date")[["open", "high", "low", "close", "volume"]]
+            result[interval] = df
+            _time.sleep(0.1)
+        except Exception:
+            continue
+
+    _mtf_cache[cache_key] = result
+    _mtf_cache_time[cache_key] = now
+    return result
+
+
+def _analyze_single_tf(df: pd.DataFrame) -> dict:
+    """Egy timeframe indikatorai es iranyjelzese."""
+    if len(df) < 20:
+        return {"direction": "NEUTRAL", "rsi": 50, "macd_bull": False,
+                "trend_up": False, "adx": 0, "vol_trend": "?"}
+
+    close = df["close"]
+    sma20 = close.rolling(20).mean()
+    trend_up = bool(close.iloc[-1] > sma20.iloc[-1])
+
+    # RSI
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    ag = gain.ewm(alpha=1/14, min_periods=14).mean()
+    al = loss.ewm(alpha=1/14, min_periods=14).mean()
+    rsi_s = 100 - (100 / (1 + ag / al))
+    rsi = float(rsi_s.iloc[-1])
+
+    # MACD
+    ef = close.ewm(span=12, adjust=False).mean()
+    es = close.ewm(span=26, adjust=False).mean()
+    macd_line = ef - es
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    macd_bull = bool(macd_line.iloc[-1] > signal_line.iloc[-1])
+
+    # ADX
+    h, l, c = df["high"], df["low"], df["close"]
+    pdm = h.diff(); mdm = -l.diff()
+    pdm = pdm.where((pdm > mdm) & (pdm > 0), 0.0)
+    mdm = mdm.where((mdm > pdm) & (mdm > 0), 0.0)
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/14, min_periods=14).mean()
+    pdi = 100 * (pdm.ewm(alpha=1/14, min_periods=14).mean() / atr)
+    mdi = 100 * (mdm.ewm(alpha=1/14, min_periods=14).mean() / atr)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    adx = float(dx.ewm(alpha=1/14, min_periods=14).mean().iloc[-1])
+
+    # Volume trend
+    vol = df["volume"].fillna(0)
+    vol_trend = "?"
+    if len(vol) >= 10:
+        recent = vol.iloc[-5:].mean()
+        older = vol.iloc[-10:-5].mean()
+        if older > 0:
+            ratio = recent / older
+            vol_trend = "UP" if ratio > 1.2 else ("DOWN" if ratio < 0.8 else "FLAT")
+
+    # Direction
+    if trend_up and (rsi > 50 or macd_bull):
+        direction = "BULLISH"
+    elif not trend_up and (rsi < 50 or not macd_bull):
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    return {
+        "direction": direction, "rsi": rsi, "macd_bull": macd_bull,
+        "trend_up": trend_up, "adx": adx, "vol_trend": vol_trend,
+    }
+
+
+def calc_mtf(symbol: str, quote: str = "USDT") -> dict:
+    """Multi-timeframe elemzes: iranyok + alignment score."""
+    tf_data = _fetch_mtf_data(symbol, quote)
+    analyses = {}
+    for interval, _ in MTF_INTERVALS:
+        if interval in tf_data:
+            analyses[interval] = _analyze_single_tf(tf_data[interval])
+        else:
+            analyses[interval] = {"direction": "NEUTRAL", "rsi": 50,
+                                  "macd_bull": False, "trend_up": False,
+                                  "adx": 0, "vol_trend": "?"}
+
+    directions = [a["direction"] for a in analyses.values()]
+    bull_count = directions.count("BULLISH")
+    bear_count = directions.count("BEARISH")
+
+    if bull_count >= 3:
+        signal = "MTF LONG CONFIRMED"
+    elif bear_count >= 3:
+        signal = "MTF SHORT CONFIRMED"
+    elif bull_count == 2 or bear_count == 2:
+        signal = "MTF WEAK"
+    else:
+        signal = "MTF CONFLICT"
+
+    return {
+        "analyses": analyses,
+        "bull_count": bull_count,
+        "bear_count": bear_count,
+        "signal": signal,
+    }
+
+
+def mtf_score_modifier(mtf_result: dict) -> int:
+    """Score modosito az MTF eredmeny alapjan."""
+    sig = mtf_result["signal"]
+    if "CONFIRMED" in sig:
+        return 15
+    if sig == "MTF CONFLICT":
+        return -20
+    return 0
+
+
+def print_mtf_table(symbol: str, mtf_result: dict) -> None:
+    """MTF osszefoglalo tablazat kiirasa."""
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    sig = mtf_result["signal"]
+    sig_color = G if "LONG" in sig else (R if "SHORT" in sig else (Y if "WEAK" in sig else R))
+
+    print(f"\n{B} MULTI-TIMEFRAME ELEMZES: {symbol}{D}")
+    print(f"  {'TF':<6}{'Trend':<10}{'RSI':<8}{'MACD':<10}{'ADX':<7}{'Vol':<7}{'Jelzes'}")
+    print(f"  {'-' * 58}")
+
+    for interval, _ in MTF_INTERVALS:
+        a = mtf_result["analyses"].get(interval, {})
+        trend_icon = G + "Bull" + D if a.get("trend_up") else R + "Bear" + D
+        rsi_v = a.get("rsi", 0)
+        macd_icon = G + "Bull" + D if a.get("macd_bull") else R + "Bear" + D
+        adx_v = a.get("adx", 0)
+        vol_t = a.get("vol_trend", "?")
+
+        d = a.get("direction", "NEUTRAL")
+        d_color = G if d == "BULLISH" else (R if d == "BEARISH" else Y)
+        print(
+            f"  {interval:<6}"
+            f"{trend_icon:<19}"
+            f"{rsi_v:<8.1f}"
+            f"{macd_icon:<19}"
+            f"{adx_v:<7.0f}"
+            f"{vol_t:<7}"
+            f"{d_color}{d}{D}"
+        )
+
+    bc = mtf_result["bull_count"]
+    brc = mtf_result["bear_count"]
+    print(f"  {'-' * 58}")
+    print(f"  Alignment: {G}{bc}/4 BULL{D} | {R}{brc}/4 BEAR{D} | "
+          f"Jelzes: {sig_color}{sig}{D}")
+
+
+# ============================================================================
+# 15. BACKTESTING MOTOR
 # ============================================================================
 def _rolling_score(df: pd.DataFrame, idx: int, window: int,
                    side: str) -> tuple:
@@ -2299,7 +2532,7 @@ def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
 
 
 # ============================================================================
-# 15. FOPROGRAM
+# 16. FOPROGRAM
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -2348,6 +2581,11 @@ def main() -> None:
     parser.add_argument("--backtest-side", default="long",
                         choices=["long", "short", "both"],
                         help="Backtest irany (alapert: long)")
+    # MTF
+    parser.add_argument("--mtf", action="store_true",
+                        help="Multi-timeframe elemzes (1h, 4h, 1d, 1w)")
+    parser.add_argument("--mtf-min", type=int, default=3,
+                        help="Minimum egyezo timeframe szam (alapert: 3)")
     args = parser.parse_args()
 
     source = args.source
@@ -2383,7 +2621,8 @@ def main() -> None:
 
     if args.scan_binance:
         run_binance_scan(args.days, args.interval, args.quote, args.min_volume,
-                         detail_threshold=args.detail_threshold)
+                         detail_threshold=args.detail_threshold,
+                         use_mtf=args.mtf)
         return
 
     if args.symbols:
@@ -2397,7 +2636,8 @@ def main() -> None:
     print(f"Coinok: {', '.join(coin_list)}\n")
     run_scanner(coin_list, args.days, source, args.provider,
                 args.interval, args.quote,
-                detail_threshold=args.detail_threshold)
+                detail_threshold=args.detail_threshold,
+                use_mtf=args.mtf)
 
 
 if __name__ == "__main__":
