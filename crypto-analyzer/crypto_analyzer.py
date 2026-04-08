@@ -1618,7 +1618,8 @@ def _prefilter_short_candidates(tickers: list, min_volume: float,
 
 def run_short_scanner(days: int, interval: str, quote: str,
                       min_volume: float, min_score: float,
-                      exclude_stablecoins: bool) -> None:
+                      exclude_stablecoins: bool,
+                      use_mtf: bool = False) -> None:
     """Short opportunity scanner - globalis Binance API, batch lekerdezesekkel."""
     global _short_scan_cache, _short_scan_cache_time
     import time
@@ -1707,6 +1708,22 @@ def run_short_scanner(days: int, interval: str, quote: str,
 
             short_score, reasons, raw_ss, ss_pen, ss_pflags = calc_short_score(df, sr, fr)
 
+            # MTF modifier
+            mtf = None
+            mtf_str = ""
+            if use_mtf:
+                try:
+                    mtf = calc_mtf(sym, quote)
+                    mtf_mod = mtf_score_modifier(mtf)
+                    # Short: csak MTF SHORT CONFIRMED ad bonust
+                    if "SHORT" in mtf.get("signal", ""):
+                        short_score = min(100, short_score + 15)
+                    elif "LONG" in mtf.get("signal", ""):
+                        short_score = max(0, short_score - 20)
+                    mtf_str = f"{mtf['bear_count']}/4"
+                except Exception:
+                    pass
+
             if short_score >= min_score:
                 last = df.iloc[-1]
                 results.append({
@@ -1722,6 +1739,8 @@ def run_short_scanner(days: int, interval: str, quote: str,
                     "df": df,
                     "sr_levels": sr,
                     "funding_rate": fr,
+                    "mtf": mtf_str,
+                    "mtf_result": mtf,
                 })
 
         except requests.exceptions.HTTPError as e:
@@ -1752,21 +1771,28 @@ def run_short_scanner(days: int, interval: str, quote: str,
     print(f"\n{R}{'=' * 95}")
     print(f" TOP {len(top20)} SHORT LEHETOSEG (score >= {min_score})")
     print(f"{'=' * 95}{D}")
-    hdr = f"  {'#':<4}{'Coin':<12}{'Ar':>14}{'24h%':>8}{'RSI':>7}{'Score':>8}  {'Fo indok'}"
+    mtf_hdr = "{'MTF':>6}" if use_mtf else ""
+    hdr = f"  {'#':<4}{'Coin':<12}{'Ar':>14}{'24h%':>8}{'RSI':>7}{'Score':>8}"
+    if use_mtf:
+        hdr += f"{'MTF':>7}"
+    hdr += f"  {'Fo indok'}"
     print(hdr)
     print(f"{'-' * 95}")
     for i, r in enumerate(top20):
         main_reason = r["reasons"][0] if r["reasons"] else "-"
         score_color = R if r["short_score"] >= 70 else (Y if r["short_score"] >= 50 else D)
-        print(
+        line = (
             f"  {i + 1:<4}"
             f"{r['symbol']:<12}"
             f"${r['price']:>12,.4g}"
             f"{r['change_pct']:>+7.2f}%"
             f"{r['rsi']:>7.1f}"
             f"  {score_color}{r['short_score']:>5.0f}{D}"
-            f"  {main_reason}"
         )
+        if use_mtf:
+            line += f"  {r.get('mtf', ''):>4}"
+        line += f"  {main_reason}"
+        print(line)
     print(f"{R}{'=' * 95}{D}")
 
     # 6. Top 5 reszletes elemzes
@@ -2616,7 +2642,7 @@ def main() -> None:
     if args.scan_shorts:
         run_short_scanner(args.days, args.interval, args.quote,
                           args.min_volume, args.min_short_score,
-                          args.exclude_stablecoins)
+                          args.exclude_stablecoins, use_mtf=args.mtf)
         return
 
     if args.scan_binance:
