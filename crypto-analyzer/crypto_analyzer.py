@@ -226,11 +226,13 @@ def _binance_interval_ms(interval: str) -> int:
 
 def fetch_binance_data(
     symbol: str, days: int = 180, interval: str = "1d", quote: str = "USDT",
+    quiet: bool = False,
 ) -> pd.DataFrame:
     """Binance publikus klines API-ról OHLCV adat lekerese."""
     bn_symbol = _symbol_to_binance(symbol, quote)
     display = _binance_display_name(bn_symbol)
-    print(f"  Adatok lekerese (Binance): {display} ({interval}, {days} nap)")
+    if not quiet:
+        print(f"  Adatok lekerese (Binance): {display} ({interval}, {days} nap)")
 
     end_ms = int(datetime.now().timestamp() * 1000)
     start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
@@ -1204,7 +1206,399 @@ def run_binance_scan(days: int, interval: str, quote: str,
 
 
 # ============================================================================
-# 12. FOPROGRAM
+# 13. SHORT SCANNER
+# ============================================================================
+STABLECOINS = {"USDC", "USDT", "DAI", "TUSD", "BUSD", "FDUSD", "USDP",
+               "PYUSD", "GUSD", "FRAX", "LUSD", "SUSD", "EUSD", "USDJ"}
+
+_short_scan_cache = {}
+_short_scan_cache_time = None
+
+
+def _detect_bearish_divergence(df: pd.DataFrame) -> dict:
+    """RSI, MACD, Volume bearish divergencia detektalas."""
+    result = {"rsi_div": False, "macd_div": False, "vol_div": False}
+    if len(df) < 30:
+        return result
+    close = df["close"]
+    rsi = df.get("rsi")
+    macd = df.get("macd")
+    vol = df["volume"].fillna(0)
+
+    # Utobbi 30 nap lokalis csucsai
+    n = min(60, len(df))
+    recent = df.iloc[-n:]
+    c = recent["close"].values
+    from scipy.signal import argrelextrema as _are
+    peaks = _are(c, np.greater_equal, order=5)[0]
+
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        # RSI divergencia: ar magasabb csucs, RSI alacsonyabb
+        if rsi is not None and c[p2] > c[p1]:
+            r_vals = recent["rsi"].values
+            if len(r_vals) > max(p1, p2) and r_vals[p2] < r_vals[p1]:
+                result["rsi_div"] = True
+        # MACD divergencia
+        if macd is not None and c[p2] > c[p1]:
+            m_vals = recent["macd"].values
+            if len(m_vals) > max(p1, p2) and m_vals[p2] < m_vals[p1]:
+                result["macd_div"] = True
+
+    # Volume divergencia: 10-nap trend - ar emelkedik, volumen csokken
+    if len(df) >= 20:
+        recent_close = close.iloc[-10:].mean()
+        older_close = close.iloc[-20:-10].mean()
+        recent_vol = vol.iloc[-10:].mean()
+        older_vol = vol.iloc[-20:-10].mean()
+        if older_close > 0 and older_vol > 0:
+            if recent_close > older_close and recent_vol < older_vol * 0.8:
+                result["vol_div"] = True
+
+    return result
+
+
+def _count_consecutive_green(df: pd.DataFrame) -> int:
+    """Egymast koveto zold gyertyak szama visszafele."""
+    count = 0
+    for i in range(len(df) - 1, 0, -1):
+        if df["close"].iloc[i] > df["close"].iloc[i - 1]:
+            count += 1
+        else:
+            break
+    return count
+
+
+def calc_short_score(df: pd.DataFrame, sr_levels: list,
+                     funding_rate: float | None = None) -> tuple[float, list[str]]:
+    """Short score (0-100) es indokok listaja."""
+    score = 0.0
+    reasons = []
+    last = df.iloc[-1]
+    close = last["close"]
+
+    # --- RSI ---
+    rsi = last.get("rsi", 50)
+    if rsi > 80:
+        score += 25
+        reasons.append(f"RSI {rsi:.0f} extrem tulvett")
+    elif rsi > 70:
+        score += 15
+        reasons.append(f"RSI {rsi:.0f} tulvett")
+
+    # --- MACD bearish crossover ---
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        if last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
+            score += 20
+            reasons.append("MACD bearish crossover")
+        elif last["macd"] < last["macd_signal"]:
+            score += 5
+            reasons.append("MACD bearish")
+
+    # --- Ellenallas kozeleben ---
+    resists = [l for l in sr_levels if l > close]
+    if resists:
+        nearest_r = min(resists)
+        if (nearest_r - close) / close < 0.02:
+            score += 15
+            reasons.append(f"Ellenallas kozel ({_P(nearest_r)})")
+
+    # --- Volume divergencia (csokken vol + emelkedo ar) ---
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 20:
+        recent_vol = vol.iloc[-5:].mean()
+        older_vol = vol.iloc[-20:-5].mean()
+        recent_price = df["close"].iloc[-5:].mean()
+        older_price = df["close"].iloc[-20:-5].mean()
+        if older_vol > 0 and recent_price > older_price and recent_vol < older_vol * 0.7:
+            score += 15
+            reasons.append("Vol. divergencia (ar fel, vol le)")
+
+    # --- ADX trend ---
+    adx = last.get("adx", 0)
+    plus_di = last.get("plus_di", 0)
+    minus_di = last.get("minus_di", 0)
+    if adx > 25 and minus_di > plus_di:
+        score += 10
+        reasons.append(f"ADX {adx:.0f} bearish (-DI > +DI)")
+
+    # --- Bollinger felso felett ---
+    bb_upper = last.get("bb_upper", None)
+    if bb_upper and pd.notna(bb_upper) and close > bb_upper:
+        score += 10
+        reasons.append("Ar Bollinger felso felett")
+
+    # --- Death cross ---
+    cross = detect_golden_death_cross(df)
+    if "DEATH CROSS" in cross:
+        score += 10
+        reasons.append("Death Cross!")
+    elif "Bearish" in cross:
+        score += 3
+
+    # --- Ichimoku bearish ---
+    sa = last.get("senkou_a", None)
+    sb = last.get("senkou_b", None)
+    if sa and sb and pd.notna(sa) and pd.notna(sb):
+        cloud_top = max(sa, sb)
+        if close < cloud_top:
+            score += 10
+            reasons.append("Ar Ichimoku felho alatt")
+
+    # --- Funding rate ---
+    if funding_rate is not None and funding_rate > 0.0005:
+        score += 10
+        reasons.append(f"Funding rate magas ({funding_rate * 100:.3f}%)")
+
+    # --- Consecutive green candles ---
+    green_count = _count_consecutive_green(df)
+    if green_count >= 5:
+        score += 5
+        reasons.append(f"{green_count} egymast koveto zold gyertya")
+
+    # --- Bearish divergenciak ---
+    divs = _detect_bearish_divergence(df)
+    if divs["rsi_div"]:
+        score += 15
+        reasons.append("RSI bearish divergencia")
+    if divs["macd_div"]:
+        score += 10
+        reasons.append("MACD bearish divergencia")
+    if divs["vol_div"] and "Vol. divergencia" not in " ".join(reasons):
+        score += 5
+
+    return min(score, 100), reasons
+
+
+def _prefilter_short_candidates(tickers: list, min_volume: float,
+                                exclude_stablecoins: bool) -> list[dict]:
+    """Eloszures: 24h change, volume, stablecoin filter."""
+    candidates = []
+    for t in tickers:
+        sym = t["symbol"]
+        if not sym.endswith("USDT"):
+            continue
+        base = sym[:-4]
+        if exclude_stablecoins and base in STABLECOINS:
+            continue
+        qv = float(t.get("quoteVolume", 0))
+        if qv < min_volume:
+            continue
+        change_pct = float(t.get("priceChangePercent", 0))
+        price = float(t.get("lastPrice", 0))
+        # Pre-filter: valoszinu short jeloltek - mar emelkedtek VAGY magas a change
+        # De mindenkit atnezunk aki megfelel a volumefilternek
+        candidates.append({
+            "symbol": sym, "base": base, "price": price,
+            "change_pct": change_pct, "quote_volume": qv,
+            "volume_24h": float(t.get("volume", 0)),
+            "high_24h": float(t.get("highPrice", 0)),
+            "low_24h": float(t.get("lowPrice", 0)),
+        })
+    return candidates
+
+
+def run_short_scanner(days: int, interval: str, quote: str,
+                      min_volume: float, min_score: float,
+                      exclude_stablecoins: bool) -> None:
+    """Short opportunity scanner - batch lekerdezesekkel."""
+    global _short_scan_cache, _short_scan_cache_time
+
+    B = Fore.CYAN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    M = Fore.MAGENTA + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    print(f"\n{R}{'=' * 70}")
+    print(f" SHORT OPPORTUNITY SCANNER")
+    print(f"{'=' * 70}{D}")
+    print(f"  Min volume: ${min_volume:,.0f} | Min score: {min_score}")
+    print(f"  Idoszak: {days} nap | Interval: {interval}")
+
+    # 1. Osszes ticker lekerese
+    print(f"\n  Tickers lekerese...", end="", flush=True)
+    now = datetime.now()
+    cache_valid = (_short_scan_cache_time and
+                   (now - _short_scan_cache_time).total_seconds() < 300 and
+                   _short_scan_cache)
+
+    if cache_valid:
+        tickers = _short_scan_cache.get("tickers", [])
+        print(f" (cached, {len(tickers)} par)")
+    else:
+        resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=15)
+        resp.raise_for_status()
+        tickers = resp.json()
+        _short_scan_cache["tickers"] = tickers
+        _short_scan_cache_time = now
+        print(f" {len(tickers)} par")
+
+    # 2. Pre-filter
+    candidates = _prefilter_short_candidates(tickers, min_volume,
+                                              exclude_stablecoins)
+    print(f"  Szurt jeloltek (vol > ${min_volume:,.0f}, USDT): {len(candidates)}")
+
+    if not candidates:
+        print(f"  {Y}Nincs jelolt a filternek megfelelo.{D}")
+        return
+
+    # 3. Mindegyikre technikai elemzes
+    results = []
+    total = len(candidates)
+    import time
+
+    for idx, cand in enumerate(candidates):
+        sym = cand["symbol"]
+        # Progress
+        if (idx + 1) % 5 == 0 or idx == total - 1:
+            print(f"\r  Szkenneles... {idx + 1}/{total} par elemezve", end="", flush=True)
+
+        try:
+            df = fetch_binance_data(sym, days=days, interval=interval,
+                                   quote=quote, quiet=True)
+            if len(df) < 20:
+                continue
+            df = add_all_indicators(df)
+            sr = get_sr_levels(df)
+
+            # Funding rate (proba)
+            fr = fetch_binance_funding_rate(sym, quote)
+
+            short_score, reasons = calc_short_score(df, sr, fr)
+
+            if short_score >= min_score:
+                last = df.iloc[-1]
+                results.append({
+                    "symbol": sym,
+                    "price": last["close"],
+                    "change_pct": cand["change_pct"],
+                    "rsi": last.get("rsi", 50),
+                    "adx": last.get("adx", 0),
+                    "macd": last.get("macd", 0),
+                    "short_score": short_score,
+                    "reasons": reasons,
+                    "volume_24h": cand["quote_volume"],
+                    "df": df,
+                    "sr_levels": sr,
+                    "funding_rate": fr,
+                })
+
+            # Rate limit: max ~20 req/sec biztonsagosan
+            time.sleep(0.15)
+
+        except Exception:
+            continue
+
+    print(f"\r  Szkenneles... {total}/{total} par elemezve - KESZ!     ")
+
+    if not results:
+        print(f"\n  {Y}Nincs short jelolt score >= {min_score} felett.{D}")
+        return
+
+    # 4. Rangsolas
+    results.sort(key=lambda x: x["short_score"], reverse=True)
+    top20 = results[:20]
+
+    # 5. Osszefoglalo tabla
+    print(f"\n{R}{'=' * 95}")
+    print(f" TOP {len(top20)} SHORT LEHETOSEG (score >= {min_score})")
+    print(f"{'=' * 95}{D}")
+    hdr = f"  {'#':<4}{'Coin':<12}{'Ar':>14}{'24h%':>8}{'RSI':>7}{'Score':>8}  {'Fo indok'}"
+    print(hdr)
+    print(f"{'-' * 95}")
+    for i, r in enumerate(top20):
+        main_reason = r["reasons"][0] if r["reasons"] else "-"
+        score_color = R if r["short_score"] >= 70 else (Y if r["short_score"] >= 50 else D)
+        print(
+            f"  {i + 1:<4}"
+            f"{r['symbol']:<12}"
+            f"${r['price']:>12,.4g}"
+            f"{r['change_pct']:>+7.2f}%"
+            f"{r['rsi']:>7.1f}"
+            f"  {score_color}{r['short_score']:>5.0f}{D}"
+            f"  {main_reason}"
+        )
+    print(f"{R}{'=' * 95}{D}")
+
+    # 6. Top 5 reszletes elemzes
+    print(f"\n{R}{'=' * 70}")
+    print(f" RESZLETES SHORT ELEMZESEK (Top 5)")
+    print(f"{'=' * 70}{D}")
+
+    for i, r in enumerate(results[:5]):
+        df = r["df"]
+        sr = r["sr_levels"]
+        last = df.iloc[-1]
+        close = last["close"]
+        atr = _calc_atr(df) if len(df) >= 15 else abs(last["high"] - last["low"])
+        fib = calc_fibonacci_retracement(df)
+
+        # Short-specifikus szintek
+        resists = sorted([l for l in sr if l > close])
+        supports = sorted([l for l in sr if l < close], reverse=True)
+
+        entry = close
+        stop = (resists[0] if resists else close + atr) + atr * 0.2
+        target1 = supports[0] if supports else close - atr * 2
+        target2 = supports[1] if len(supports) > 1 else target1 - atr
+
+        risk = stop - close
+        reward = close - target1
+        rr = reward / risk if risk > 0 else 0
+
+        # Kockazat szint
+        vol_24h = r["volume_24h"]
+        if atr / close > 0.08 or vol_24h < 200_000:
+            risk_level = "MAGAS"
+            risk_color = R
+        elif atr / close > 0.04 or vol_24h < 1_000_000:
+            risk_level = "KOZEPES"
+            risk_color = Y
+        else:
+            risk_level = "ALACSONY"
+            risk_color = G
+
+        dd30 = _calc_max_drawdown(df, min(30, len(df)))
+
+        print(f"\n{R}{'=' * 70}")
+        print(f" SHORT TERV: {r['symbol']} (#{i + 1} - Score: {r['short_score']:.0f}/100)")
+        print(f"{'=' * 70}{D}")
+        print(f"  {R}SHORT BELEPES:{D} {_P(entry)} kozeleben")
+        print(f"    Stop-loss:  {R}{_P(stop)}{D} (ellenallas + ATR felett)")
+        print(f"    Target 1:   {G}{_P(target1)}{D} (legkozelebbi tamasz)")
+        print(f"    Target 2:   {G}{_P(target2)}{D}")
+        print(f"    R:R = 1:{rr:.1f}")
+        print(f"  Indokok: {', '.join(r['reasons'][:4])}")
+        print(f"  Kockazat: {risk_color}{risk_level}{D}")
+        print(f"{'-' * 70}")
+        print(f"  Ar: {_P(close)} | 24h: {r['change_pct']:+.2f}%")
+        print(f"  RSI: {r['rsi']:.1f} | ADX: {r['adx']:.1f} | MACD: {r['macd']:.4g}")
+        if r["funding_rate"] is not None:
+            print(f"  Funding Rate: {r['funding_rate'] * 100:.4f}%")
+        print(f"  24h Volume: ${vol_24h:,.0f}")
+        print(f"  ATR: {_P(atr)} ({atr / close * 100:.1f}%)")
+        print(f"  Max DD 30 nap: {dd30:.1f}%")
+
+        # Divergenciak
+        divs = _detect_bearish_divergence(df)
+        div_list = []
+        if divs["rsi_div"]:
+            div_list.append("RSI")
+        if divs["macd_div"]:
+            div_list.append("MACD")
+        if divs["vol_div"]:
+            div_list.append("Volume")
+        if div_list:
+            print(f"  Divergenciak: {Y}{', '.join(div_list)}{D}")
+
+        print(f"{R}{'=' * 70}{D}")
+
+
+# ============================================================================
+# 14. FOPROGRAM
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1225,18 +1619,30 @@ def main() -> None:
                         help="Quote currency Binance-hoz (USDT, BUSD, BTC, ETH)")
     parser.add_argument("--scan-binance", action="store_true",
                         help="Binance top 50 USDT par scan")
+    parser.add_argument("--scan-shorts", action="store_true",
+                        help="Short opportunity scanner - osszes USDT par")
     parser.add_argument("--min-volume", type=float, default=1_000_000,
-                        help="Minimum 24h volume USD-ben (scan-binance-hoz)")
+                        help="Minimum 24h volume USD-ben")
+    parser.add_argument("--min-short-score", type=float, default=60,
+                        help="Minimum short score (0-100, alapert: 60)")
+    parser.add_argument("--exclude-stablecoins", action="store_true", default=True,
+                        help="Stablecoinok kiszurese (alapert: igen)")
     args = parser.parse_args()
 
     source = args.source
-    if args.scan_binance:
+    if args.scan_binance or args.scan_shorts:
         source = "binance"
 
     print(f"\nCrypto Swing Trading Analyzer")
     print(f"Idoszak: {args.days} nap | Forras: {source}"
           + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
+
+    if args.scan_shorts:
+        run_short_scanner(args.days, args.interval, args.quote,
+                          args.min_volume, args.min_short_score,
+                          args.exclude_stablecoins)
+        return
 
     if args.scan_binance:
         run_binance_scan(args.days, args.interval, args.quote, args.min_volume)
