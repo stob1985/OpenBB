@@ -3329,14 +3329,558 @@ def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
         print(f"{'=' * 85}")
 
 
+
+
+# ============================================================================
+# STRATEGY DETECTORS
+# ============================================================================
+def _detect_reversal_candle_4h(symbol: str, quote: str = "USDT") -> str | None:
+    """4h charton fordulos gyertya kereses (hammer, engulfing)."""
+    try:
+        bn = _symbol_to_binance(symbol, quote)
+        resp = requests.get(f"{BINANCE_BASE_URL}/klines",
+                            params={"symbol": bn, "interval": "4h", "limit": 3}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        rows = resp.json()
+        if len(rows) < 2:
+            return None
+        # Utolso 4h gyertya
+        o, h, l, c = [float(rows[-1][i]) for i in (1, 2, 3, 4)]
+        po, pc = float(rows[-2][1]), float(rows[-2][4])
+        body = abs(c - o)
+        rng = h - l if h > l else 0.0001
+        # Hammer (bullish): kis test alul, hosszu also kanoc
+        lower_wick = min(o, c) - l
+        if lower_wick > body * 2 and c > o:
+            return "hammer"
+        # Bullish engulfing
+        if pc < po and c > o and c > po and o < pc:
+            return "bull_engulfing"
+        # Bearish engulfing
+        if pc > po and c < o and c < po and o > pc:
+            return "bear_engulfing"
+        # Shooting star (bearish)
+        upper_wick = h - max(o, c)
+        if upper_wick > body * 2 and c < o:
+            return "shooting_star"
+    except Exception:
+        pass
+    return None
+
+
+def detect_pullback(df: pd.DataFrame, symbol: str, quote: str = "USDT",
+                    use_mtf: bool = False) -> dict:
+    """Pullback stratégia: trend irányba visszahúzás keresése."""
+    if len(df) < 30:
+        return {"score": 0, "direction": None, "signals": []}
+
+    last = df.iloc[-1]
+    close = last["close"]
+    score = 0
+    signals = []
+    direction = None
+
+    tenkan = float(last.get("tenkan", close))
+    kijun = float(last.get("kijun", close))
+    sa = float(last.get("senkou_a", close)) if pd.notna(last.get("senkou_a")) else close
+    sb = float(last.get("senkou_b", close)) if pd.notna(last.get("senkou_b")) else close
+    kumo_top = max(sa, sb)
+    kumo_bot = min(sa, sb)
+    sma20 = float(last.get("sma_20", close))
+    rsi = float(last.get("rsi", 50))
+
+    # ---- LONG PULLBACK ----
+    long_score = 0
+    # Kumo felett + TK bullish
+    if close > kumo_top and tenkan > kijun:
+        long_score += 30
+        signals.append("Ar Kumo felett + TK bullish")
+    # RSI visszahuzas 40-60
+    if 40 <= rsi <= 60:
+        # Volt-e 65+ az elmult 10 napban?
+        rsi_series = df.get("rsi")
+        if rsi_series is not None and len(rsi_series) >= 10:
+            if rsi_series.iloc[-10:].max() >= 65:
+                long_score += 20
+                signals.append(f"RSI visszahuzas ({rsi:.0f}, volt {rsi_series.iloc[-10:].max():.0f})")
+    # Ar Kijun/SMA20 kozeleben
+    kijun_dist = abs(close - kijun) / close
+    sma20_dist = abs(close - sma20) / close
+    if kijun_dist < 0.02 or sma20_dist < 0.02:
+        long_score += 20
+        pb_level = _P(kijun) if kijun_dist < sma20_dist else _P(sma20)
+        signals.append(f"Ar pullback szintnel ({pb_level})")
+    # Kumo felso szelenel
+    kumo_top_dist = abs(close - kumo_top) / close
+    if kumo_top_dist < 0.03 and close > kumo_top:
+        long_score += 10
+        signals.append("Ar Kumo felso kozeleben")
+    # Volume csokken (pullback = alacsony vol)
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 5:
+        if vol.iloc[-1] < vol.iloc[-4:-1].mean() * 0.8:
+            long_score += 15
+            signals.append("Vol csokken (egeszseges pullback)")
+    # 4h reversal gyertya
+    candle = _detect_reversal_candle_4h(symbol, quote)
+    if candle in ("hammer", "bull_engulfing"):
+        long_score += 15
+        signals.append(f"4h reversal gyertya: {candle}")
+
+    # ---- SHORT PULLBACK ----
+    short_score = 0
+    short_signals = []
+    if close < kumo_bot and tenkan < kijun:
+        short_score += 30
+        short_signals.append("Ar Kumo alatt + TK bearish")
+    if 40 <= rsi <= 60:
+        rsi_series = df.get("rsi")
+        if rsi_series is not None and len(rsi_series) >= 10:
+            if rsi_series.iloc[-10:].min() <= 35:
+                short_score += 20
+                short_signals.append(f"RSI rally ({rsi:.0f}, volt {rsi_series.iloc[-10:].min():.0f})")
+    if kijun_dist < 0.02 or sma20_dist < 0.02:
+        short_score += 20
+        short_signals.append(f"Ar rally szintnel")
+    if candle in ("shooting_star", "bear_engulfing"):
+        short_score += 15
+        short_signals.append(f"4h reversal gyertya: {candle}")
+    if len(vol) >= 5 and vol.iloc[-1] < vol.iloc[-4:-1].mean() * 0.8:
+        short_score += 15
+        short_signals.append("Vol csokken (rally gyengeseg)")
+
+    if long_score >= short_score:
+        direction = "LONG"
+        score = long_score
+        entry = min(kijun, sma20) if long_score > 40 else close
+        stop = kumo_bot - (kumo_top - kumo_bot) * 0.1
+    else:
+        direction = "SHORT"
+        score = short_score
+        signals = short_signals
+        entry = max(kijun, sma20) if short_score > 40 else close
+        stop = kumo_top + (kumo_top - kumo_bot) * 0.1
+
+    return {"score": min(score, 100), "direction": direction,
+            "signals": signals, "entry": entry, "stop": stop,
+            "rsi": rsi, "kijun": kijun, "sma20": sma20}
+
+
+def detect_breakout(df: pd.DataFrame, bb_analysis: dict,
+                    ichi_analysis: dict, mtf_result: dict | None) -> dict:
+    """Kumo breakout detector: ar a Kumo-ban/kozeleben + BB Squeeze."""
+    if len(df) < 30:
+        return {"score": 0, "direction": None, "signals": []}
+
+    last = df.iloc[-1]
+    close = last["close"]
+    score = 0
+    signals = []
+
+    sa = float(last.get("senkou_a", close)) if pd.notna(last.get("senkou_a")) else close
+    sb = float(last.get("senkou_b", close)) if pd.notna(last.get("senkou_b")) else close
+    kumo_top = max(sa, sb)
+    kumo_bot = min(sa, sb)
+    kumo_thick = (kumo_top - kumo_bot) / close * 100 if close > 0 else 50
+    in_kumo = kumo_bot <= close <= kumo_top
+    near_kumo = abs(close - kumo_top) / close < 0.03 or abs(close - kumo_bot) / close < 0.03
+
+    # BB Squeeze
+    squeeze = any("SQUEEZE" in s for s in bb_analysis.get("signals", []))
+    if squeeze:
+        score += 25
+        signals.append("BB Squeeze aktiv")
+    # Kumo vekony
+    if kumo_thick < 5:
+        score += 15
+        signals.append(f"Kumo vekony ({kumo_thick:.1f}%)")
+    elif kumo_thick < 10:
+        score += 8
+        signals.append(f"Kumo kozepes ({kumo_thick:.1f}%)")
+
+    # Ar pozicio
+    if in_kumo or near_kumo:
+        score += 10
+        signals.append("Ar a Kumo-ban/kozeleben")
+
+    # Breakout (3% penetracio)
+    breakout_up = close > kumo_top * 1.03
+    breakout_down = close < kumo_bot * 0.97
+    if breakout_up:
+        score += 20
+        signals.append(f"Breakout FELFELÉ (+{(close/kumo_top-1)*100:.1f}% a Kumo felett)")
+    elif breakout_down:
+        score += 20
+        signals.append(f"Breakout LEFELÉ ({(1-close/kumo_bot)*100:.1f}% a Kumo alatt)")
+
+    # Chikou megerosites
+    if len(df) > 26:
+        chikou_ref = df["close"].iloc[-27]
+        if (breakout_up and close > chikou_ref) or (breakout_down and close < chikou_ref):
+            score += 15
+            signals.append("Chikou megerositi")
+
+    # Volume spike
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 20:
+        avg = vol.iloc[-21:-1].mean()
+        if avg > 0 and vol.iloc[-1] > avg * 1.5:
+            score += 15
+            signals.append(f"Volume spike ({vol.iloc[-1]/avg:.1f}x)")
+
+    # MTF
+    if mtf_result:
+        bc = mtf_result.get("bull_count", 0)
+        brc = mtf_result.get("bear_count", 0)
+        if bc >= 3 or brc >= 3:
+            score += 10
+            signals.append(f"MTF {'bull' if bc >= 3 else 'bear'} ({max(bc,brc)}/4)")
+
+    # Irány
+    if breakout_up or (in_kumo and close > (kumo_top + kumo_bot) / 2):
+        direction = "LONG"
+        trigger = kumo_top
+    elif breakout_down or (in_kumo and close < (kumo_top + kumo_bot) / 2):
+        direction = "SHORT"
+        trigger = kumo_bot
+    else:
+        direction = "???"
+        trigger = close
+
+    return {"score": min(score, 100), "direction": direction,
+            "signals": signals, "kumo_thick": kumo_thick,
+            "squeeze": squeeze, "trigger": trigger,
+            "kumo_top": kumo_top, "kumo_bot": kumo_bot}
+
+
+def detect_squeeze_convergence(df: pd.DataFrame, bb_analysis: dict,
+                                ichi_analysis: dict, ew_analysis: dict,
+                                conv_analysis: dict, mtf_result: dict | None) -> dict:
+    """Squeeze + konvergencia: legritkabb, legerosebb jelzes."""
+    if len(df) < 30:
+        return {"score": 0, "direction": None, "signals": []}
+
+    last = df.iloc[-1]
+    close = last["close"]
+    adx = float(last.get("adx", 25))
+    score = 0
+    signals = []
+
+    # BB Squeeze 5+ nap
+    squeeze_days = 0
+    if "bb_upper" in df and len(df) >= 25:
+        widths = (df["bb_upper"] - df["bb_lower"]).iloc[-25:]
+        q25 = widths.quantile(0.25)
+        for i in range(len(widths) - 1, -1, -1):
+            if widths.iloc[i] <= q25:
+                squeeze_days += 1
+            else:
+                break
+    if squeeze_days >= 5:
+        score += 25
+        signals.append(f"BB Squeeze {squeeze_days} napja")
+    elif squeeze_days >= 3:
+        score += 15
+        signals.append(f"BB Squeeze {squeeze_days} napja")
+
+    # Konvergencia
+    conv_total = conv_analysis.get("total", 0)
+    if conv_total >= 4:
+        score += 30
+        signals.append(f"Konvergencia 4/4")
+    elif conv_total >= 3:
+        score += 20
+        signals.append(f"Konvergencia 3/4")
+
+    # Elliott
+    ew_wave = ew_analysis.get("wave", "?")
+    if ew_wave in ("3",):
+        score += 15
+        signals.append(f"Elliott Wave 3 (eros)")
+    elif ew_wave in ("bearish_impulse",):
+        score += 15
+        signals.append("Elliott bearish impulzus")
+
+    # MTF
+    if mtf_result:
+        bc = mtf_result.get("bull_count", 0)
+        brc = mtf_result.get("bear_count", 0)
+        if bc >= 3 or brc >= 3:
+            score += 15
+            signals.append(f"MTF {max(bc,brc)}/4")
+
+    # ADX alacsony
+    if adx < 20:
+        score += 10
+        signals.append(f"ADX {adx:.0f} (kompresszio)")
+
+    # Volume profil
+    vp = calc_volume_profile(df, bins=10)
+    if not vp.empty:
+        peak_price = vp.loc[vp["volume"].idxmax(), "price"]
+        if abs(close - peak_price) / close < 0.03:
+            score += 5
+            signals.append(f"Akkumulacios zona kozel ({_P(peak_price)})")
+
+    # Irany
+    conv_bull = conv_analysis.get("bull", 0)
+    conv_bear = conv_analysis.get("bear", 0)
+    direction = "LONG" if conv_bull > conv_bear else ("SHORT" if conv_bear > conv_bull else "???")
+
+    return {"score": min(score, 100), "direction": direction,
+            "signals": signals, "squeeze_days": squeeze_days,
+            "conv_total": conv_total}
+
+
+def _coin_passes_filter(df: pd.DataFrame, vol_24h: float, penalty: float) -> bool:
+    """Ellenorzi hogy a coin atmegy-e az alapszuron."""
+    if vol_24h < 1_000_000:
+        return False
+    close = df["close"].iloc[-1]
+    atr = float((df["high"] - df["low"]).rolling(14).mean().iloc[-1])
+    atr_pct = atr / close * 100 if close > 0 else 99
+    if atr_pct > 12:
+        return False
+    if penalty >= 20:
+        return False
+    return True
+
+
+def _calc_rr(entry: float, stop: float, target: float, direction: str) -> float:
+    """Risk/Reward ratio."""
+    if direction == "LONG":
+        risk = entry - stop
+        reward = target - entry
+    else:
+        risk = stop - entry
+        reward = entry - target
+    return reward / risk if risk > 0 else 0
+
+
 # ============================================================================
 # 16. FULL SCAN (--scan-all)
 # ============================================================================
 def run_full_scan(days: int, interval: str, quote: str,
                   min_volume: float, min_short_score: float,
                   use_mtf: bool) -> None:
-    """Teljes scan: long + short, osszes par, top 3+3 reszletes elemzes."""
+    """Teljes scan: 3 strategia, osszes par, reszletes top jeloltek."""
     import os, time as _time
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    M = Fore.MAGENTA + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    os.makedirs("results", exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    outfile = f"results/full_scan_{ts}.txt"
+
+    import io, sys
+    class Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    logf = open(outfile, "w")
+    old_stdout = sys.stdout
+    sys.stdout = Tee(old_stdout, logf)
+
+    try:
+        print(f"\n{B}{'=' * 75}")
+        print(f" STRATEGY SCANNER — {ts}")
+        print(f"{'=' * 75}{D}")
+        print(f"  Min volume: ${min_volume:,.0f} | MTF: {'ON' if use_mtf else 'OFF'}")
+        print(f"  Strategiak: Pullback | Breakout | Squeeze Convergence\n")
+
+        # 1. Parok betoltese
+        all_symbols = scan_binance_top_pairs(quote, min_volume, limit=0)
+        print(f"  Szurt parok: {len(all_symbols)}\n")
+
+        pullbacks = []
+        breakouts = []
+        squeezes = []
+        total = len(all_symbols)
+
+        for idx, sym in enumerate(all_symbols):
+            if (idx + 1) % 10 == 0 or idx == total - 1:
+                pct = (idx + 1) / total * 100
+                print(f"\r  Szkenneles... {idx+1}/{total} ({pct:.0f}%)   ", end="", flush=True)
+            try:
+                df = fetch_binance_data(sym, days=days, interval=interval,
+                                       quote=quote, quiet=True)
+                if len(df) < 30:
+                    continue
+                df = add_all_indicators(df)
+
+                # Coin szuro
+                vol_24h = float(df["volume"].iloc[-1])
+                _, _, _, penalty, _ = calc_swing_score(df, [])
+                if not _coin_passes_filter(df, vol_24h, penalty):
+                    continue
+
+                sr = get_sr_levels(df)
+                ichi = analyze_ichimoku(df)
+                bb = analyze_bollinger(df)
+                ew = analyze_elliott(df)
+
+                mtf = None
+                if use_mtf:
+                    try:
+                        mtf = calc_mtf(sym, quote)
+                    except Exception:
+                        pass
+
+                conv = analyze_convergence(ichi, bb, ew, mtf)
+
+                # 3 strategia
+                pb = detect_pullback(df, sym, quote, use_mtf)
+                if pb["score"] >= 50:
+                    pb["symbol"] = sym
+                    pb["close"] = float(df["close"].iloc[-1])
+                    pb["df"] = df
+                    pb["sr"] = sr
+                    pb["mtf_result"] = mtf
+                    pullbacks.append(pb)
+
+                bo = detect_breakout(df, bb, ichi, mtf)
+                if bo["score"] >= 40:
+                    bo["symbol"] = sym
+                    bo["close"] = float(df["close"].iloc[-1])
+                    bo["df"] = df
+                    bo["sr"] = sr
+                    bo["mtf_result"] = mtf
+                    breakouts.append(bo)
+
+                sq = detect_squeeze_convergence(df, bb, ichi, ew, conv, mtf)
+                if sq["score"] >= 40:
+                    sq["symbol"] = sym
+                    sq["close"] = float(df["close"].iloc[-1])
+                    sq["df"] = df
+                    sq["sr"] = sr
+                    sq["mtf_result"] = mtf
+                    sq["conv"] = conv
+                    squeezes.append(sq)
+
+                _time.sleep(0.1)
+            except Exception:
+                continue
+
+        print(f"\r  Szkenneles... {total}/{total} (100%) - KESZ!         \n")
+
+        # ---- PULLBACK tabla ----
+        pullbacks.sort(key=lambda x: x["score"], reverse=True)
+        print(f"\n{G}{'=' * 80}")
+        print(f" PULLBACK LEHETOSEGEK ({len(pullbacks)} talalat)")
+        print(f"{'=' * 80}{D}")
+        if pullbacks:
+            print(f"  {'#':<4}{'Coin':<14}{'PB Score':>9}{'Trend':>7}{'RSI':>7}"
+                  f"{'Pullback szint':>16}  {'Jelzesek'}")
+            print(f"  {'-' * 75}")
+            for i, p in enumerate(pullbacks[:10]):
+                trend = G + "BULL" + D if p["direction"] == "LONG" else R + "BEAR" + D
+                pb_lvl = _P(p.get("kijun", p["close"]))
+                sigs = "; ".join(p["signals"][:2])
+                print(f"  {i+1:<4}{p['symbol']:<14}{p['score']:>6}/100"
+                      f"  {trend}  {p['rsi']:>6.1f}{pb_lvl:>16}  {sigs}")
+        else:
+            print(f"  {Y}Nincs pullback jelolt.{D}")
+
+        # ---- BREAKOUT tabla ----
+        breakouts.sort(key=lambda x: x["score"], reverse=True)
+        print(f"\n{Y}{'=' * 80}")
+        print(f" BREAKOUT KESZULODEESEK ({len(breakouts)} talalat)")
+        print(f"{'=' * 80}{D}")
+        if breakouts:
+            print(f"  {'#':<4}{'Coin':<14}{'BO Score':>9}{'Kumo%':>7}{'Squeeze':>9}"
+                  f"{'Irany':>7}{'Trigger':>14}  {'Jelzesek'}")
+            print(f"  {'-' * 75}")
+            for i, b in enumerate(breakouts[:10]):
+                sq_str = "aktiv" if b.get("squeeze") else "-"
+                d = b.get("direction", "?")
+                d_str = G + d + D if d == "LONG" else (R + d + D if d == "SHORT" else Y + d + D)
+                trig = _P(b.get("trigger", b["close"]))
+                sigs = "; ".join(b["signals"][:2])
+                print(f"  {i+1:<4}{b['symbol']:<14}{b['score']:>6}/100"
+                      f"  {b['kumo_thick']:>5.1f}%{sq_str:>9}"
+                      f"  {d_str}  {trig:>12}  {sigs}")
+        else:
+            print(f"  {Y}Nincs breakout jelolt.{D}")
+
+        # ---- SQUEEZE KONVERGENCIA tabla ----
+        squeezes.sort(key=lambda x: x["score"], reverse=True)
+        print(f"\n{M}{'=' * 80}")
+        print(f" SQUEEZE KONVERGENCIA JELZESEK ({len(squeezes)} talalat)")
+        print(f"{'=' * 80}{D}")
+        if squeezes:
+            print(f"  {'#':<4}{'Coin':<14}{'SQ Score':>9}{'Konv':>6}{'Squeeze':>9}"
+                  f"{'Irany':>7}  {'Jelzesek'}")
+            print(f"  {'-' * 75}")
+            for i, s in enumerate(squeezes[:10]):
+                d = s.get("direction", "?")
+                d_str = G + d + D if d == "LONG" else (R + d + D if d == "SHORT" else Y + d + D)
+                conv_str = f"{s.get('conv_total', 0)}/4"
+                sq_str = f"{s.get('squeeze_days', 0)}d" if s.get("squeeze_days", 0) > 0 else "-"
+                sigs = "; ".join(s["signals"][:2])
+                print(f"  {i+1:<4}{s['symbol']:<14}{s['score']:>6}/100"
+                      f"  {conv_str:>5}{sq_str:>9}"
+                      f"  {d_str}  {sigs}")
+        else:
+            print(f"  {Y}Nincs squeeze konvergencia jelolt.{D}")
+
+        # ---- TOP RESZLETES ELEMZESEK ----
+        detail_candidates = []
+        for p in pullbacks[:2]:
+            detail_candidates.append(("PULLBACK", p))
+        for b in breakouts[:2]:
+            detail_candidates.append(("BREAKOUT", b))
+        for s in squeezes[:2]:
+            detail_candidates.append(("SQUEEZE", s))
+
+        if detail_candidates:
+            print(f"\n{B}{'=' * 75}")
+            print(f" RESZLETES ELEMZESEK — TOP JELOLTEK")
+            print(f"{'=' * 75}{D}")
+
+            for strat_name, item in detail_candidates:
+                sym = item["symbol"]
+                d_str = item.get("direction", "?")
+                print(f"\n{M}--- {strat_name} | {sym} | {d_str} (Score: {item['score']}) ---{D}")
+                try:
+                    bx = None
+                    try:
+                        bx = fetch_binance_ticker_24h(sym, quote)
+                    except Exception:
+                        pass
+                    print_summary(item["df"], sym, item["sr"], bx,
+                                  mtf_result=item.get("mtf_result"))
+                    plot_chart(item["df"], sym, item["sr"])
+                except Exception as e:
+                    print(f"  HIBA: {e}")
+
+        # Summary
+        print(f"\n{B}{'=' * 75}")
+        print(f" SCAN OSSZEFOGLALO — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"{'=' * 75}{D}")
+        print(f"  Szkennelt parok:    {total}")
+        print(f"  Pullback jeloltek:  {len(pullbacks)}")
+        print(f"  Breakout jeloltek:  {len(breakouts)}")
+        print(f"  Squeeze jeloltek:   {len(squeezes)}")
+        print(f"  Reszletes elemzes:  {len(detail_candidates)} coin")
+
+    finally:
+        sys.stdout = old_stdout
+        logf.close()
+
+    print(f"\n  Eredmeny mentve: {outfile}")
+    print(f"  Meret: {os.path.getsize(outfile) / 1024:.0f} KB")
     B = Fore.CYAN + Style.BRIGHT
     G = Fore.GREEN + Style.BRIGHT
     R = Fore.RED + Style.BRIGHT
