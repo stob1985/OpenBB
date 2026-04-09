@@ -2903,8 +2903,9 @@ def _rolling_score(df: pd.DataFrame, idx: int, window: int,
 def run_backtest(symbol: str, days: int, source: str, provider: str,
                  interval: str, quote: str, threshold: float,
                  sl_pct: float, tp_pct: float, capital: float,
-                 risk_pct: float, side: str) -> dict:
-    """Backtest motor egyetlen coinra."""
+                 risk_pct: float, side: str,
+                 strategy: str = "score") -> dict:
+    """Backtest motor egyetlen coinra. strategy: score/pullback/breakout/squeeze."""
     B = Fore.CYAN + Style.BRIGHT
     R = Fore.RED + Style.BRIGHT
     G = Fore.GREEN + Style.BRIGHT
@@ -2960,8 +2961,8 @@ def run_backtest(symbol: str, days: int, source: str, provider: str,
                 exit_reason = "Take-profit"
                 exit_price = entry * (1 + tp_pct/100) if direction == "long" else entry * (1 - tp_pct/100)
                 pl_pct = tp_pct
-            elif days_held >= 14:
-                exit_reason = "Timeout (14 nap)"
+            elif days_held >= 28:
+                exit_reason = "Timeout (28 nap)"
             else:
                 # Score check
                 sc, _, _ = _rolling_score(df, i, window, direction)
@@ -2990,19 +2991,59 @@ def run_backtest(symbol: str, days: int, source: str, provider: str,
             continue
 
         # Nincs pozicio: check signal
-        test_side = side if side != "both" else "long"
-        sc, raw, pen = _rolling_score(df, i, window, test_side)
+        # Sub-df az aktualis pontig
+        sub = df.iloc[max(0, i - window + 1):i + 1].copy()
+        if len(sub) < 20:
+            equity.append(current_capital)
+            continue
 
-        # Both: ha long score alacsony, probaljuk short-ot
-        if side == "both" and sc < threshold:
-            sc2, raw2, pen2 = _rolling_score(df, i, window, "short")
-            if sc2 >= threshold:
-                sc, test_side = sc2, "short"
+        sc = 0
+        test_side = side if side != "both" else "long"
+
+        if strategy == "score":
+            sc, raw, pen = _rolling_score(df, i, window, test_side)
+            if side == "both" and sc < threshold:
+                sc2, _, _ = _rolling_score(df, i, window, "short")
+                if sc2 >= threshold:
+                    sc, test_side = sc2, "short"
+        else:
+            # Strategia-alapu belepesi jelzes
+            sub = add_all_indicators(sub)
+            sr = get_sr_levels(sub)
+            ichi = analyze_ichimoku(sub)
+            bb = analyze_bollinger(sub)
+            ew = analyze_elliott(sub)
+            conv = analyze_convergence(ichi, bb, ew, None)
+
+            if strategy == "pullback":
+                det = detect_pullback(sub, symbol, quote, False,
+                                      sr_levels=sr, conv_analysis=conv)
+            elif strategy == "breakout":
+                det = detect_breakout(sub, bb, ichi, None)
+            elif strategy == "squeeze":
+                det = detect_squeeze_convergence(sub, bb, ichi, ew, conv, None)
+            else:
+                det = {"score": 0, "direction": None}
+
+            sc = det.get("score", 0)
+            d = det.get("direction")
+            if d == "LONG":
+                test_side = "long"
+            elif d == "SHORT":
+                test_side = "short"
+            elif side == "both":
+                test_side = "long"
+
+            # Both: ha a detektor iranya nem egyezik a side-dal
+            if side == "long" and test_side == "short":
+                sc = 0
+            elif side == "short" and test_side == "long":
+                sc = 0
 
         if sc >= threshold:
             size_usd = current_capital * risk_pct / 100 / (sl_pct / 100)
             size_usd = min(size_usd, current_capital * 0.3)
-            if size_usd > 10:  # min $10 pozicio
+            if size_usd > 10:
                 position = {
                     "entry_price": close,
                     "entry_idx": i,
@@ -3273,17 +3314,20 @@ def _walk_forward(result: dict, capital: float, sl_pct: float,
 def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
                        interval: str, quote: str, threshold: float,
                        sl_pct: float, tp_pct: float, capital: float,
-                       risk_pct: float, side: str) -> None:
+                       risk_pct: float, side: str,
+                       strategy: str = "score") -> None:
     """Backtest futtatasa egy vagy tobb coinra."""
     B = Fore.CYAN + Style.BRIGHT
     D = Style.RESET_ALL
 
+    strat_label = strategy.upper() if strategy != "score" else "SWING SCORE"
     print(f"\n{B}{'=' * 75}")
-    print(f" BACKTESTING ENGINE")
+    print(f" BACKTESTING ENGINE — {strat_label}")
     print(f"{'=' * 75}{D}")
     print(f"  Coinok: {', '.join(symbols)}")
-    print(f"  Idoszak: {days} nap | Side: {side} | Threshold: {threshold}")
-    print(f"  SL: {sl_pct}% | TP: {tp_pct}% | Capital: ${capital:,.0f} | Risk: {risk_pct}%")
+    print(f"  Strategia: {strat_label} | Idoszak: {days} nap | Side: {side}")
+    print(f"  Threshold: {threshold} | SL: {sl_pct}% | TP: {tp_pct}%")
+    print(f"  Capital: ${capital:,.0f} | Risk: {risk_pct}%")
     print()
 
     all_results = []
@@ -3292,7 +3336,7 @@ def run_backtest_suite(symbols: list, days: int, source: str, provider: str,
         try:
             result = run_backtest(sym, days, source, provider, interval,
                                   quote, threshold, sl_pct, tp_pct,
-                                  capital, risk_pct, side)
+                                  capital, risk_pct, side, strategy)
             metrics = _calc_backtest_metrics(result)
             _print_backtest_results(result, metrics)
             if metrics["total"] > 0:
@@ -4168,6 +4212,9 @@ def main() -> None:
     parser.add_argument("--backtest-side", default="long",
                         choices=["long", "short", "both"],
                         help="Backtest irany (alapert: long)")
+    parser.add_argument("--strategy", default="score",
+                        choices=["score", "pullback", "breakout", "squeeze"],
+                        help="Backtest strategia (score/pullback/breakout/squeeze)")
     # MTF
     parser.add_argument("--mtf", action="store_true",
                         help="Multi-timeframe elemzes (1h, 4h, 1d, 1w)")
@@ -4202,7 +4249,7 @@ def main() -> None:
             coin_list, args.backtest_days, source, args.provider,
             args.interval, args.quote, args.backtest_threshold,
             args.backtest_sl, args.backtest_tp, args.backtest_capital,
-            args.backtest_risk, args.backtest_side)
+            args.backtest_risk, args.backtest_side, args.strategy)
         return
 
     if args.scan_shorts:
