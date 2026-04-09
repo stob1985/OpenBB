@@ -3370,7 +3370,9 @@ def _detect_reversal_candle_4h(symbol: str, quote: str = "USDT") -> str | None:
 
 
 def detect_pullback(df: pd.DataFrame, symbol: str, quote: str = "USDT",
-                    use_mtf: bool = False) -> dict:
+                    use_mtf: bool = False,
+                    sr_levels: list | None = None,
+                    conv_analysis: dict | None = None) -> dict:
     """Pullback stratégia: trend irányba visszahúzás keresése."""
     if len(df) < 30:
         return {"score": 0, "direction": None, "signals": []}
@@ -3455,15 +3457,57 @@ def detect_pullback(df: pd.DataFrame, symbol: str, quote: str = "USDT",
         score = long_score
         entry = min(kijun, sma20) if long_score > 40 else close
         stop = kumo_bot - (kumo_top - kumo_bot) * 0.1
+        # Target: legkozelebbi ellenallas
+        _sr = sr_levels or []
+        resists = sorted([l for l in _sr if l > close])
+        target = resists[0] if resists else close + (close - stop) * 2
     else:
         direction = "SHORT"
         score = short_score
         signals = short_signals
         entry = max(kijun, sma20) if short_score > 40 else close
         stop = kumo_top + (kumo_top - kumo_bot) * 0.1
+        _sr = sr_levels or []
+        supports = sorted([l for l in _sr if l < close], reverse=True)
+        target = supports[0] if supports else close - (stop - close) * 2
+
+    # --- MINOSEGI SZUROK ---
+    # 0. Konvergencia VEGYES -> max 40
+    if conv_analysis and "VEGYES" in conv_analysis.get("signal", ""):
+        if score > 40:
+            score = 40
+            signals.append("Konvergencia VEGYES — score max 40")
+
+    # 1. R:R < 1:1.5 -> score = 0
+    if direction == "LONG":
+        risk = entry - stop
+        reward = target - entry
+    else:
+        risk = stop - entry
+        reward = entry - target
+    rr = reward / risk if risk > 0 else 0
+    if rr < 1.5:
+        score = 0
+        signals.append(f"R:R {rr:.1f} < 1.5 — tul kicsi, kiszurve")
+
+    # 2. Tamasz-ellenallas tavolsag < 3% -> ne ajánld
+    sr_range = abs(target - entry) / close * 100 if close > 0 else 0
+    if sr_range < 3 and score > 0:
+        score = 0
+        signals.append(f"S/R tavolsag {sr_range:.1f}% < 3% — szuk tartomany")
+
+    # 3. Volume 5d/30d < 0.6x -> -20 pont
+    vol = df["volume"].fillna(0)
+    if len(vol) >= 30:
+        vol_5d = vol.iloc[-5:].mean()
+        vol_30d = vol.iloc[-31:-1].mean()
+        if vol_30d > 0 and vol_5d / vol_30d < 0.6:
+            score = max(0, score - 20)
+            signals.append(f"Vol 5d/30d {vol_5d/vol_30d:.2f}x < 0.6 — penalty")
 
     return {"score": min(score, 100), "direction": direction,
             "signals": signals, "entry": entry, "stop": stop,
+            "target": target, "rr": rr,
             "rsi": rsi, "kijun": kijun, "sma20": sma20}
 
 
@@ -3741,7 +3785,8 @@ def run_full_scan(days: int, interval: str, quote: str,
                 conv = analyze_convergence(ichi, bb, ew, mtf)
 
                 # 3 strategia
-                pb = detect_pullback(df, sym, quote, use_mtf)
+                pb = detect_pullback(df, sym, quote, use_mtf,
+                                    sr_levels=sr, conv_analysis=conv)
                 if pb["score"] >= 50:
                     pb["symbol"] = sym
                     pb["close"] = float(df["close"].iloc[-1])
