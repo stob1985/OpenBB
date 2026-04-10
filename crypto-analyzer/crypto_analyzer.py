@@ -2332,9 +2332,19 @@ LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "2L", "2S")
 def _get_valid_usdt_symbols() -> set[str]:
     """ExchangeInfo-ból TRADING statuszu USDT parok, kiszurve a leveraged tokeneket."""
     try:
-        resp = requests.get(f"{BINANCE_BASE_URL}/exchangeInfo", timeout=15)
-        resp.raise_for_status()
-        symbols_info = resp.json().get("symbols", [])
+        import time as _t3
+        symbols_info = []
+        for _r in range(4):
+            try:
+                resp = requests.get(f"{BINANCE_BASE_URL}/exchangeInfo", timeout=20)
+                resp.raise_for_status()
+                symbols_info = resp.json().get("symbols", [])
+                break
+            except Exception:
+                if _r < 3:
+                    _t3.sleep(2 ** (_r + 1))
+                else:
+                    return set()
         valid = set()
         for s in symbols_info:
             if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
@@ -2425,9 +2435,17 @@ def run_short_scanner(days: int, interval: str, quote: str,
         tickers = _short_scan_cache.get("tickers", [])
         print(f" (cached, {len(tickers)} par)")
     else:
-        resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=15)
-        resp.raise_for_status()
-        tickers = resp.json()
+        for _retry in range(4):
+            try:
+                resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=20)
+                resp.raise_for_status()
+                tickers = resp.json()
+                break
+            except Exception as _e:
+                if _retry < 3:
+                    import time as _t2; _t2.sleep(2 ** (_retry + 1))
+                else:
+                    raise
         _short_scan_cache["tickers"] = tickers
         _short_scan_cache_time = now
         print(f" {len(tickers)} par")
