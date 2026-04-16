@@ -3040,6 +3040,8 @@ def run_backtest(symbol: str, days: int, source: str, provider: str,
                 det = detect_breakout(sub, bb, ichi, None)
             elif strategy == "squeeze":
                 det = detect_squeeze_convergence(sub, bb, ichi, ew, conv, None)
+            elif strategy == "golden":
+                det = detect_golden_setup(sub)
             else:
                 det = {"score": 0, "direction": None}
 
@@ -4178,6 +4180,240 @@ def run_full_scan(days: int, interval: str, quote: str,
     print(f"  Meret: {os.path.getsize(outfile) / 1024:.0f} KB")
 
 
+
+# ============================================================================
+# GOLDEN SETUP DETEKTOR
+# ============================================================================
+def calc_rvol(df: pd.DataFrame, window: int = 20) -> float:
+    """Relative Volume: mai vol / 20 napos atlag."""
+    vol = df["volume"].fillna(0)
+    if len(vol) < window + 1:
+        return 1.0
+    avg = vol.iloc[-(window + 1):-1].mean()
+    return float(vol.iloc[-1] / avg) if avg > 0 else 1.0
+
+
+def detect_golden_setup(df: pd.DataFrame) -> dict:
+    """Golden Setup: 6 feltetel egyuttes vizsgalata.
+    Returns: score (0/60/80/100), direction, criteria dict, signals list."""
+    if len(df) < 52:
+        return {"score": 0, "direction": None, "criteria": {}, "signals": []}
+
+    close = df["close"]
+    last = df.iloc[-1]
+    c = float(close.iloc[-1])
+
+    # --- Indikatorok ---
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    has_sma200 = sma200.notna().iloc[-1]
+
+    # ADX
+    adx_val = float(last.get("adx", 0)) if "adx" in df.columns else 0
+
+    # RSI
+    rsi_val = float(last.get("rsi", 50)) if "rsi" in df.columns else 50
+    rsi_series = df.get("rsi")
+    rsi_was_high = False
+    rsi_was_low = False
+    if rsi_series is not None and len(rsi_series) >= 15:
+        rsi_was_high = bool(rsi_series.iloc[-15:-1].max() >= 60)
+        rsi_was_low = bool(rsi_series.iloc[-15:-1].min() <= 40)
+
+    # MACD histogram
+    macd_hist = df.get("macd_hist")
+    hist_turn_bull = False
+    hist_turn_bear = False
+    if macd_hist is not None and len(macd_hist) >= 3:
+        h = macd_hist.iloc[-3:].values
+        # Bull: elozok negativ, utolso pozitiv vagy emelkedo
+        if h[-2] < 0 and h[-1] > h[-2]:
+            hist_turn_bull = True
+        if h[-1] > 0 and h[-2] <= 0:
+            hist_turn_bull = True
+        # Bear: elozok pozitiv, utolso negativ vagy csokken
+        if h[-2] > 0 and h[-1] < h[-2]:
+            hist_turn_bear = True
+        if h[-1] < 0 and h[-2] >= 0:
+            hist_turn_bear = True
+
+    # OBV trend (10 nap)
+    obv = df.get("obv")
+    obv_rising = False
+    obv_falling = False
+    if obv is not None and len(obv) >= 11:
+        obv_10 = obv.iloc[-10:]
+        obv_slope = (float(obv_10.iloc[-1]) - float(obv_10.iloc[0]))
+        if obv_slope > 0:
+            obv_rising = True
+        elif obv_slope < 0:
+            obv_falling = True
+
+    # RVOL
+    rvol = calc_rvol(df)
+
+    # --- LONG criteria ---
+    long_criteria = {
+        "sma_golden": bool(has_sma200 and sma50.iloc[-1] > sma200.iloc[-1]),
+        "adx_strong": bool(adx_val > 25),
+        "rsi_pullback": bool(40 <= rsi_val <= 50 and rsi_was_high),
+        "macd_turn": hist_turn_bull,
+        "obv_rising": obv_rising,
+        "rvol_confirm": bool(rvol >= 1.5),
+    }
+    long_count = sum(long_criteria.values())
+
+    # --- SHORT criteria ---
+    short_criteria = {
+        "sma_death": bool(has_sma200 and sma50.iloc[-1] < sma200.iloc[-1]),
+        "adx_strong": bool(adx_val > 25),
+        "rsi_rally": bool(50 <= rsi_val <= 60 and rsi_was_low),
+        "macd_turn": hist_turn_bear,
+        "obv_falling": obv_falling,
+        "rvol_confirm": bool(rvol >= 1.5),
+    }
+    short_count = sum(short_criteria.values())
+
+    # --- Valasztas ---
+    if long_count >= short_count and long_count >= 4:
+        direction = "LONG"
+        count = long_count
+        criteria = long_criteria
+    elif short_count >= 4:
+        direction = "SHORT"
+        count = short_count
+        criteria = short_criteria
+    else:
+        # Nincs eleg jelzes
+        direction = None
+        count = max(long_count, short_count)
+        criteria = long_criteria if long_count >= short_count else short_criteria
+
+    if count >= 6:
+        score = 100
+        label = "GOLDEN SETUP"
+    elif count == 5:
+        score = 80
+        label = "STRONG SETUP"
+    elif count == 4:
+        score = 60
+        label = "WEAK SETUP"
+    else:
+        score = 0
+        label = "NO SETUP"
+
+    # Jelzesek szoveg
+    signals = []
+    for k, v in criteria.items():
+        icon = "V" if v else "X"
+        names = {
+            "sma_golden": "SMA50 > SMA200 (golden cross)",
+            "sma_death": "SMA50 < SMA200 (death cross)",
+            "adx_strong": f"ADX {adx_val:.0f} > 25 (eros trend)",
+            "rsi_pullback": f"RSI {rsi_val:.0f} pullback 40-50 (volt 60+)",
+            "rsi_rally": f"RSI {rsi_val:.0f} rally 50-60 (volt <40)",
+            "macd_turn": "MACD histogram fordulas",
+            "obv_rising": "OBV emelkedo (10 nap)",
+            "obv_falling": "OBV csokken (10 nap)",
+            "rvol_confirm": f"RVOL {rvol:.2f}x (>1.5x)",
+        }
+        signals.append(f"  {icon} {names.get(k, k)}")
+
+    return {
+        "score": score, "direction": direction, "count": count,
+        "label": label, "criteria": criteria, "signals": signals,
+        "rvol": rvol, "adx": adx_val, "rsi": rsi_val,
+    }
+
+
+def run_golden_scan(days: int, interval: str, quote: str,
+                    min_volume: float) -> None:
+    """Golden Setup scanner — csak 4/6+ matcheket mutat."""
+    import time as _time
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    print(f"\n{B}{'=' * 75}")
+    print(f" GOLDEN SETUP SCANNER")
+    print(f"{'=' * 75}{D}")
+    print(f"  Min volume: ${min_volume:,.0f} | Min match: 4/6")
+
+    all_symbols = scan_binance_top_pairs(quote, min_volume, limit=0)
+    print(f"  Szurt parok: {len(all_symbols)}\n")
+
+    results = []
+    total = len(all_symbols)
+
+    for idx, sym in enumerate(all_symbols):
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            print(f"\r  Szkenneles... {idx+1}/{total} ({(idx+1)/total*100:.0f}%)   ",
+                  end="", flush=True)
+        try:
+            df = fetch_binance_data(sym, days=days, interval=interval,
+                                   quote=quote, quiet=True)
+            if len(df) < 52:
+                continue
+            df = add_all_indicators(df)
+
+            # Pump filter
+            _, _, _, penalty, _ = calc_swing_score(df, [])
+            if penalty >= 20:
+                continue
+
+            gs = detect_golden_setup(df)
+            if gs["score"] >= 60:
+                gs["symbol"] = sym
+                gs["close"] = float(df["close"].iloc[-1])
+                gs["df"] = df
+                results.append(gs)
+
+            _time.sleep(0.1)
+        except Exception:
+            continue
+
+    print(f"\r  Szkenneles... {total}/{total} (100%) - KESZ!         \n")
+
+    # Tabla
+    results.sort(key=lambda x: x["score"], reverse=True)
+    goldens = [r for r in results if r["score"] == 100]
+    strongs = [r for r in results if r["score"] == 80]
+    weaks = [r for r in results if r["score"] == 60]
+
+    print(f"  Talalatok: {len(goldens)} GOLDEN | {len(strongs)} STRONG | {len(weaks)} WEAK\n")
+
+    if not results:
+        print(f"  {Y}Nincs Golden Setup jelolt ma.{D}")
+        return
+
+    print(f"{'=' * 85}")
+    print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Label':>14}{'Match':>7}{'Dir':>7}"
+          f"{'RSI':>7}{'ADX':>7}{'RVOL':>7}")
+    print(f"{'-' * 85}")
+    for i, r in enumerate(results[:20]):
+        d = r.get("direction", "?")
+        d_str = G + d + D if d == "LONG" else (R + d + D if d == "SHORT" else d)
+        label = r["label"]
+        lc = G if "GOLDEN" in label else (Y if "STRONG" in label else D)
+        print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}"
+              f"  {lc}{label:<12}{D}{r['count']}/6"
+              f"  {d_str}"
+              f"{r['rsi']:>7.0f}{r['adx']:>7.0f}{r['rvol']:>6.1f}x")
+    print(f"{'=' * 85}")
+
+    # Top 3 reszletes
+    for r in results[:3]:
+        sym = r["symbol"]
+        d = r.get("direction", "?")
+        print(f"\n{B}--- {r['label']}: {sym} ({d}) ---{D}")
+        for s in r["signals"]:
+            print(s)
+        print()
+
+
+
 # ============================================================================
 # 17. FOPROGRAM
 # ============================================================================
@@ -4204,6 +4440,8 @@ def main() -> None:
                         help="Short opportunity scanner - osszes USDT par")
     parser.add_argument("--scan-all", action="store_true",
                         help="TELJES scan: long + short, osszes par, top 3+3 reszletes")
+    parser.add_argument("--scan-golden", action="store_true",
+                        help="Golden Setup scanner: 6 felteteles jelzes detektor")
     parser.add_argument("--min-volume", type=float, default=1_000_000,
                         help="Minimum 24h volume USD-ben")
     parser.add_argument("--min-short-score", type=float, default=60,
@@ -4231,7 +4469,7 @@ def main() -> None:
                         choices=["long", "short", "both"],
                         help="Backtest irany (alapert: long)")
     parser.add_argument("--strategy", default="score",
-                        choices=["score", "pullback", "breakout", "squeeze"],
+                        choices=["score", "pullback", "breakout", "squeeze", "golden"],
                         help="Backtest strategia (score/pullback/breakout/squeeze)")
     # MTF
     parser.add_argument("--mtf", action="store_true",
@@ -4241,7 +4479,7 @@ def main() -> None:
     args = parser.parse_args()
 
     source = args.source
-    if args.scan_binance or args.scan_shorts or args.scan_all:
+    if args.scan_binance or args.scan_shorts or args.scan_all or args.scan_golden:
         source = "binance"
     if args.backtest and source == "openbb":
         source = "binance"
@@ -4250,6 +4488,10 @@ def main() -> None:
     print(f"Idoszak: {args.days} nap | Forras: {source}"
           + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
+
+    if args.scan_golden:
+        run_golden_scan(args.days, args.interval, args.quote, args.min_volume)
+        return
 
     if args.scan_all:
         run_full_scan(args.days, args.interval, args.quote,
