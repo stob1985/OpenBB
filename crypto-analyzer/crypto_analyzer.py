@@ -3052,6 +3052,8 @@ def run_backtest(symbol: str, days: int, source: str, provider: str,
                 det = detect_squeeze_convergence(sub, bb, ichi, ew, conv, None)
             elif strategy == "golden":
                 det = detect_golden_setup(sub)
+            elif strategy == "inverse-golden":
+                det = detect_inverse_golden(sub)
             else:
                 det = {"score": 0, "direction": None}
 
@@ -4397,6 +4399,264 @@ def run_golden_scan(days: int, interval: str, quote: str, min_volume: float) -> 
         print(f"\n  {dc}FINAL SCORE: {r['final_score']} -> {r['decision']}{D}")
 
 
+
+
+# ============================================================================
+# SMART STRATEGY ROUTER + INVERSE GOLDEN SETUP
+# ============================================================================
+def classify_trend(df: pd.DataFrame) -> str:
+    """Coin trend osztalyozas: BULLISH / BEARISH / NEUTRAL."""
+    if len(df) < 200:
+        sma50 = df["close"].rolling(50).mean()
+        sma_long = df["close"].rolling(min(len(df) - 1, 100)).mean()
+        if sma50.notna().iloc[-1] and sma_long.notna().iloc[-1]:
+            if sma50.iloc[-1] > sma_long.iloc[-1] * 1.02:
+                return "BULLISH"
+            elif sma50.iloc[-1] < sma_long.iloc[-1] * 0.98:
+                return "BEARISH"
+        return "NEUTRAL"
+    sma50 = df["close"].rolling(50).mean().iloc[-1]
+    sma200 = df["close"].rolling(200).mean().iloc[-1]
+    if pd.notna(sma50) and pd.notna(sma200):
+        if sma50 > sma200 * 1.01:
+            return "BULLISH"
+        elif sma50 < sma200 * 0.99:
+            return "BEARISH"
+    return "NEUTRAL"
+
+
+def detect_inverse_golden(df: pd.DataFrame) -> dict:
+    """Inverse Golden Setup: SHORT-specifikus 6-kritérium detektor bearish trendben."""
+    empty = {"score": 0, "final_score": 0, "direction": "SHORT",
+             "criteria": {}, "signals": [], "confidence": [],
+             "label": "NO SETUP", "decision": "NE LEPJ BE",
+             "count": 0, "conf": 0, "rvol": 1.0, "adx": 0, "rsi": 50, "skip": False}
+    if len(df) < 52:
+        return empty
+
+    close = df["close"]
+    last = df.iloc[-1]
+    c = float(close.iloc[-1])
+
+    trend = classify_trend(df)
+    if trend != "BEARISH":
+        empty["signals"] = ["X Trend nem BEARISH — inverse golden nem fut"]
+        return empty
+
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    has200 = sma200.notna().iloc[-1]
+    adx_val = float(last.get("adx", 0)) if "adx" in df.columns else 0
+    rsi_val = float(last.get("rsi", 50)) if "rsi" in df.columns else 50
+    rsi_s = df.get("rsi")
+    rsi_was_low = bool(rsi_s is not None and len(rsi_s) >= 11 and rsi_s.iloc[-11:-1].min() <= 40)
+
+    mh = df.get("macd_hist")
+    ht_bear = False
+    if mh is not None and len(mh) >= 3:
+        h = mh.iloc[-3:].values
+        ht_bear = bool((h[-2] > 0 and h[-1] < h[-2]) or (h[-1] < 0 and h[-2] >= 0))
+
+    obv_s = df.get("obv")
+    obv_dn = False
+    if obv_s is not None and len(obv_s) >= 11:
+        obv_dn = float(obv_s.iloc[-1]) - float(obv_s.iloc[-10]) < 0
+
+    rvol = calc_rvol(df)
+
+    criteria = {
+        "sma_death": bool(has200 and sma50.iloc[-1] < sma200.iloc[-1]),
+        "adx_strong": bool(adx_val > 25),
+        "rsi_rally": bool(50 <= rsi_val <= 60 and rsi_was_low),
+        "macd_turn": ht_bear,
+        "obv_falling": obv_dn,
+        "rvol": bool(rvol >= 1.5),
+    }
+    count = sum(criteria.values())
+
+    if count >= 6: score, label = 100, "INV GOLDEN"
+    elif count == 5: score, label = 80, "INV STRONG"
+    elif count == 4: score, label = 60, "INV WEAK"
+    else: score, label = 0, "NO SETUP"
+
+    names = {"sma_death": "SMA50 < SMA200 (death cross)",
+             "adx_strong": f"ADX {adx_val:.0f} > 25",
+             "rsi_rally": f"RSI {rsi_val:.0f} rally 50-60 (volt <40)",
+             "macd_turn": "MACD bear fordulas",
+             "obv_falling": "OBV csokken (10d)",
+             "rvol": f"RVOL {rvol:.1f}x (>=1.5)"}
+    signals = [f"  {'V' if v else 'X'} {names.get(k,k)}" for k, v in criteria.items()]
+
+    # Konfidencia
+    conf = 0
+    conf_d = []
+    skip = False
+
+    if score >= 60:
+        ichi = analyze_ichimoku(df)
+        if ichi.get("bear", 0) >= 4:
+            conf += 15; conf_d.append(f"V Ichimoku {ichi['bear']}/5 bearish (+15)")
+        bb = analyze_bollinger(df)
+        if any("SQUEEZE" in s for s in bb.get("signals", [])):
+            conf += 10; conf_d.append("V BB Squeeze aktiv (+10)")
+        if any("FELFELE" in s for s in bb.get("signals", [])):
+            conf -= 20; conf_d.append("X BB Walk UP ellentmond (-20)")
+            skip = True
+        sr = get_sr_levels(df)
+        ress = [l for l in sr if l > c and (l - c) / c < 0.02]
+        if ress:
+            conf += 10; conf_d.append(f"V Ellenallas kozel ({_P(min(ress))}) (+10)")
+        _, _, _, pen, _ = calc_swing_score(df, sr)
+        if pen > 30: skip = True; conf_d.append(f"X PUMP penalty {pen} (SKIP)")
+        if len(df) >= 15:
+            tr = pd.concat([df["high"]-df["low"], (df["high"]-df["close"].shift()).abs(),
+                           (df["low"]-df["close"].shift()).abs()], axis=1).max(axis=1)
+            ap = float(tr.rolling(14).mean().iloc[-1] / c * 100) if c > 0 else 0
+            if ap > 10: conf -= 15; conf_d.append(f"X ATR {ap:.1f}% > 10% (-15)")
+
+    fs = max(0, score + conf)
+    if skip: dec = "NE LEPJ BE"
+    elif fs >= 100: dec = "PERFEKT SHORT — azonnal belepj"
+    elif fs >= 85: dec = "EROS SHORT — magas konfidencia"
+    elif fs >= 70: dec = "KOZEPES SHORT — ovatosan"
+    elif fs >= 60: dec = "GYENGE SHORT — varj megerositesre"
+    else: dec = "NE LEPJ BE"
+
+    return {"score": score, "final_score": fs, "direction": "SHORT",
+            "count": count, "label": label, "criteria": criteria,
+            "signals": signals, "confidence": conf_d, "conf": conf,
+            "rvol": rvol, "adx": adx_val, "rsi": rsi_val,
+            "decision": dec, "skip": skip}
+
+
+def smart_route(df: pd.DataFrame, symbol: str, quote: str = "USDT") -> dict:
+    """Smart Strategy Router: trend alapjan valaszt strategiat."""
+    trend = classify_trend(df)
+    result = {"trend": trend, "symbol": symbol, "strategies": []}
+
+    if trend == "BULLISH":
+        gs = detect_golden_setup(df)
+        if gs["score"] >= 60 and not gs["skip"]:
+            result["strategies"].append(("GOLDEN LONG", gs))
+    elif trend == "BEARISH":
+        ig = detect_inverse_golden(df)
+        if ig["score"] >= 60 and not ig["skip"]:
+            result["strategies"].append(("INV GOLDEN SHORT", ig))
+        # Breakout short is
+        bb = analyze_bollinger(df)
+        ichi = analyze_ichimoku(df)
+        bo = detect_breakout(df, bb, ichi, None)
+        if bo["score"] >= 60 and bo.get("direction") == "SHORT":
+            result["strategies"].append(("BREAKOUT SHORT", bo))
+    else:
+        # Neutral: squeeze only
+        bb = analyze_bollinger(df)
+        ichi = analyze_ichimoku(df)
+        ew = analyze_elliott(df)
+        conv = analyze_convergence(ichi, bb, ew, None)
+        sq = detect_squeeze_convergence(df, bb, ichi, ew, conv, None)
+        if sq["score"] >= 60:
+            result["strategies"].append(("SQUEEZE", sq))
+
+    return result
+
+
+def run_smart_scan(days: int, interval: str, quote: str, min_volume: float) -> None:
+    """Smart scan: trend-alapu strategia hozzarendeles minden coinhoz."""
+    import time as _time
+    B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
+
+    print(f"\n{B}{'='*75}\n SMART STRATEGY SCANNER\n{'='*75}{D}")
+    print(f"  Bullish -> Golden Long | Bearish -> Inv Golden/Breakout Short | Neutral -> Squeeze")
+    all_sym = scan_binance_top_pairs(quote, min_volume, limit=0)
+    print(f"  Szurt parok: {len(all_sym)}\n")
+
+    bull_results, bear_results, neutral_results = [], [], []
+    bull_cnt = bear_cnt = neut_cnt = 0
+    total = len(all_sym)
+
+    for idx, sym in enumerate(all_sym):
+        if (idx+1) % 10 == 0 or idx == total-1:
+            print(f"\r  Szkenneles... {idx+1}/{total} ({(idx+1)/total*100:.0f}%)   ", end="", flush=True)
+        try:
+            df = fetch_binance_data(sym, days=days, interval=interval, quote=quote, quiet=True)
+            if len(df) < 52: continue
+            df = add_all_indicators(df)
+            _, _, _, pen, _ = calc_swing_score(df, [])
+            if pen >= 20: continue
+
+            route = smart_route(df, sym, quote)
+            trend = route["trend"]
+            c = float(df["close"].iloc[-1])
+
+            if trend == "BULLISH": bull_cnt += 1
+            elif trend == "BEARISH": bear_cnt += 1
+            else: neut_cnt += 1
+
+            for strat_name, det in route["strategies"]:
+                entry = {"symbol": sym, "close": c, "trend": trend,
+                         "strategy": strat_name, "det": det, "df": df}
+                fs = det.get("final_score", det.get("score", 0))
+                entry["final_score"] = fs
+                if trend == "BULLISH": bull_results.append(entry)
+                elif trend == "BEARISH": bear_results.append(entry)
+                else: neutral_results.append(entry)
+
+            _time.sleep(0.1)
+        except Exception: continue
+
+    print(f"\r  Szkenneles... {total}/{total} (100%) - KESZ!         \n")
+    print(f"  Trendek: {G}{bull_cnt} BULLISH{D} | {R}{bear_cnt} BEARISH{D} | {Y}{neut_cnt} NEUTRAL{D}")
+    print(f"  Jeloltek: {len(bull_results)} long | {len(bear_results)} short | {len(neutral_results)} squeeze\n")
+
+    # BULLISH tabla
+    bull_results.sort(key=lambda x: x["final_score"], reverse=True)
+    print(f"{G}{'='*80}\n BULLISH COINOK — GOLDEN LONG ({len(bull_results)} jelolt)\n{'='*80}{D}")
+    if bull_results:
+        print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Label':>14}{'Final':>7}{'RSI':>6}{'RVOL':>6}  {'Dontes'}")
+        print(f"  {'-'*75}")
+        for i, r in enumerate(bull_results[:10]):
+            d = r["det"]
+            print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}  {d.get('label','?'):<12}{d.get('final_score',0):>5}{d.get('rsi',0):>6.0f}{d.get('rvol',1):>5.1f}x  {d.get('decision','?')[:30]}")
+    else:
+        print(f"  {Y}Nincs golden long jelolt.{D}")
+
+    # BEARISH tabla
+    bear_results.sort(key=lambda x: x["final_score"], reverse=True)
+    print(f"\n{R}{'='*80}\n BEARISH COINOK — INV GOLDEN / BREAKOUT SHORT ({len(bear_results)} jelolt)\n{'='*80}{D}")
+    if bear_results:
+        print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Strat':>18}{'Score':>7}{'RSI':>6}{'RVOL':>6}  {'Dontes'}")
+        print(f"  {'-'*75}")
+        for i, r in enumerate(bear_results[:15]):
+            d = r["det"]
+            sc = d.get("final_score", d.get("score", 0))
+            print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}  {r['strategy']:<16}{sc:>5}{d.get('rsi',0):>6.0f}{d.get('rvol',1):>5.1f}x  {d.get('decision', '')[:30]}")
+    else:
+        print(f"  {Y}Nincs bearish jelolt.{D}")
+
+    # NEUTRAL
+    neutral_results.sort(key=lambda x: x["final_score"], reverse=True)
+    print(f"\n{Y}{'='*80}\n SEMLEGES — SQUEEZE ({len(neutral_results)} jelolt)\n{'='*80}{D}")
+    if neutral_results:
+        print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Score':>7}{'Irany':>7}  {'Jelzesek'}")
+        print(f"  {'-'*60}")
+        for i, r in enumerate(neutral_results[:10]):
+            d = r["det"]
+            print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}{d.get('score',0):>6}{d.get('direction','?'):>7}  {'; '.join(d.get('signals',[][:2]))[:40]}")
+    else:
+        print(f"  {Y}Nincs squeeze jelolt.{D}")
+
+    # Osszefoglalo
+    all_r = bull_results + bear_results + neutral_results
+    all_r.sort(key=lambda x: x["final_score"], reverse=True)
+    if all_r:
+        print(f"\n{B}{'='*80}\n TOP 5 — MINDEN STRATEGIA\n{'='*80}{D}")
+        for i, r in enumerate(all_r[:5]):
+            d = r["det"]
+            tc = G if r["trend"]=="BULLISH" else (R if r["trend"]=="BEARISH" else Y)
+            print(f"  {i+1}. {r['symbol']:<12} {tc}{r['trend']:<8}{D} {r['strategy']:<18} Final: {r['final_score']:>4}  {d.get('decision','')[:35]}")
+
+
 # ============================================================================
 # 17. FOPROGRAM
 # ============================================================================
@@ -4425,6 +4685,8 @@ def main() -> None:
                         help="TELJES scan: long + short, osszes par, top 3+3 reszletes")
     parser.add_argument("--scan-golden", action="store_true",
                         help="Golden Setup scanner: 6 felteteles jelzes detektor")
+    parser.add_argument("--scan-smart", action="store_true",
+                        help="Smart Strategy Scanner: trend-alapu automatikus strategia")
     parser.add_argument("--min-volume", type=float, default=1_000_000,
                         help="Minimum 24h volume USD-ben")
     parser.add_argument("--min-short-score", type=float, default=60,
@@ -4452,7 +4714,7 @@ def main() -> None:
                         choices=["long", "short", "both"],
                         help="Backtest irany (alapert: long)")
     parser.add_argument("--strategy", default="score",
-                        choices=["score", "pullback", "breakout", "squeeze", "golden"],
+                        choices=["score", "pullback", "breakout", "squeeze", "golden", "inverse-golden"],
                         help="Backtest strategia (score/pullback/breakout/squeeze)")
     # MTF
     parser.add_argument("--mtf", action="store_true",
@@ -4462,7 +4724,7 @@ def main() -> None:
     args = parser.parse_args()
 
     source = args.source
-    if args.scan_binance or args.scan_shorts or args.scan_all or args.scan_golden:
+    if args.scan_binance or args.scan_shorts or args.scan_all or args.scan_golden or args.scan_smart:
         source = "binance"
     if args.backtest and source == "openbb":
         source = "binance"
@@ -4474,6 +4736,10 @@ def main() -> None:
 
     if args.scan_golden:
         run_golden_scan(args.days, args.interval, args.quote, args.min_volume)
+        return
+
+    if args.scan_smart:
+        run_smart_scan(args.days, args.interval, args.quote, args.min_volume)
         return
 
     if args.scan_all:
