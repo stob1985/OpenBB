@@ -4181,8 +4181,12 @@ def run_full_scan(days: int, interval: str, quote: str,
 
 
 
+
+
+
+
 # ============================================================================
-# GOLDEN SETUP DETEKTOR
+# GOLDEN SETUP DETEKTOR + KONFIDENCIA RENDSZER
 # ============================================================================
 def calc_rvol(df: pd.DataFrame, window: int = 20) -> float:
     """Relative Volume: mai vol / 20 napos atlag."""
@@ -4194,224 +4198,193 @@ def calc_rvol(df: pd.DataFrame, window: int = 20) -> float:
 
 
 def detect_golden_setup(df: pd.DataFrame) -> dict:
-    """Golden Setup: 6 feltetel egyuttes vizsgalata.
-    Returns: score (0/60/80/100), direction, criteria dict, signals list."""
+    """Golden Setup: 6 feltetel + konfidencia rendszer."""
+    empty = {"score": 0, "final_score": 0, "direction": None,
+             "criteria": {}, "signals": [], "confidence": [],
+             "label": "NO SETUP", "decision": "NE LEPJ BE",
+             "count": 0, "conf": 0, "rvol": 1.0, "adx": 0, "rsi": 50, "skip": False}
     if len(df) < 52:
-        return {"score": 0, "direction": None, "criteria": {}, "signals": []}
+        return empty
 
     close = df["close"]
     last = df.iloc[-1]
     c = float(close.iloc[-1])
 
-    # --- Indikatorok ---
     sma50 = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
-    has_sma200 = sma200.notna().iloc[-1]
-
-    # ADX
+    has200 = sma200.notna().iloc[-1]
     adx_val = float(last.get("adx", 0)) if "adx" in df.columns else 0
-
-    # RSI
     rsi_val = float(last.get("rsi", 50)) if "rsi" in df.columns else 50
-    rsi_series = df.get("rsi")
-    rsi_was_high = False
-    rsi_was_low = False
-    if rsi_series is not None and len(rsi_series) >= 15:
-        rsi_was_high = bool(rsi_series.iloc[-15:-1].max() >= 60)
-        rsi_was_low = bool(rsi_series.iloc[-15:-1].min() <= 40)
+    rsi_s = df.get("rsi")
+    rsi_was_high = bool(rsi_s is not None and len(rsi_s) >= 11 and rsi_s.iloc[-11:-1].max() >= 60)
+    rsi_was_low = bool(rsi_s is not None and len(rsi_s) >= 11 and rsi_s.iloc[-11:-1].min() <= 40)
 
-    # MACD histogram
-    macd_hist = df.get("macd_hist")
-    hist_turn_bull = False
-    hist_turn_bear = False
-    if macd_hist is not None and len(macd_hist) >= 3:
-        h = macd_hist.iloc[-3:].values
-        # Bull: elozok negativ, utolso pozitiv vagy emelkedo
-        if h[-2] < 0 and h[-1] > h[-2]:
-            hist_turn_bull = True
-        if h[-1] > 0 and h[-2] <= 0:
-            hist_turn_bull = True
-        # Bear: elozok pozitiv, utolso negativ vagy csokken
-        if h[-2] > 0 and h[-1] < h[-2]:
-            hist_turn_bear = True
-        if h[-1] < 0 and h[-2] >= 0:
-            hist_turn_bear = True
+    mh = df.get("macd_hist")
+    ht_bull = ht_bear = False
+    if mh is not None and len(mh) >= 3:
+        h = mh.iloc[-3:].values
+        ht_bull = bool((h[-2] < 0 and h[-1] > h[-2]) or (h[-1] > 0 and h[-2] <= 0))
+        ht_bear = bool((h[-2] > 0 and h[-1] < h[-2]) or (h[-1] < 0 and h[-2] >= 0))
 
-    # OBV trend (10 nap)
-    obv = df.get("obv")
-    obv_rising = False
-    obv_falling = False
-    if obv is not None and len(obv) >= 11:
-        obv_10 = obv.iloc[-10:]
-        obv_slope = (float(obv_10.iloc[-1]) - float(obv_10.iloc[0]))
-        if obv_slope > 0:
-            obv_rising = True
-        elif obv_slope < 0:
-            obv_falling = True
+    obv_s = df.get("obv")
+    obv_up = obv_dn = False
+    if obv_s is not None and len(obv_s) >= 11:
+        sl = float(obv_s.iloc[-1]) - float(obv_s.iloc[-10])
+        obv_up = sl > 0
+        obv_dn = sl < 0
 
-    # RVOL
     rvol = calc_rvol(df)
 
-    # --- LONG criteria ---
-    long_criteria = {
-        "sma_golden": bool(has_sma200 and sma50.iloc[-1] > sma200.iloc[-1]),
-        "adx_strong": bool(adx_val > 25),
-        "rsi_pullback": bool(40 <= rsi_val <= 50 and rsi_was_high),
-        "macd_turn": hist_turn_bull,
-        "obv_rising": obv_rising,
-        "rvol_confirm": bool(rvol >= 1.5),
-    }
-    long_count = sum(long_criteria.values())
+    lc = {"sma_trend": bool(has200 and sma50.iloc[-1] > sma200.iloc[-1]),
+          "adx_strong": bool(adx_val > 25),
+          "rsi_pullback": bool(40 <= rsi_val <= 50 and rsi_was_high),
+          "macd_turn": ht_bull, "obv_trend": obv_up,
+          "rvol": bool(rvol >= 1.5)}
+    sc2 = {"sma_trend": bool(has200 and sma50.iloc[-1] < sma200.iloc[-1]),
+           "adx_strong": bool(adx_val > 25),
+           "rsi_pullback": bool(50 <= rsi_val <= 60 and rsi_was_low),
+           "macd_turn": ht_bear, "obv_trend": obv_dn,
+           "rvol": bool(rvol >= 1.5)}
 
-    # --- SHORT criteria ---
-    short_criteria = {
-        "sma_death": bool(has_sma200 and sma50.iloc[-1] < sma200.iloc[-1]),
-        "adx_strong": bool(adx_val > 25),
-        "rsi_rally": bool(50 <= rsi_val <= 60 and rsi_was_low),
-        "macd_turn": hist_turn_bear,
-        "obv_falling": obv_falling,
-        "rvol_confirm": bool(rvol >= 1.5),
-    }
-    short_count = sum(short_criteria.values())
+    lcnt = sum(lc.values())
+    scnt = sum(sc2.values())
 
-    # --- Valasztas ---
-    if long_count >= short_count and long_count >= 4:
-        direction = "LONG"
-        count = long_count
-        criteria = long_criteria
-    elif short_count >= 4:
-        direction = "SHORT"
-        count = short_count
-        criteria = short_criteria
+    if lcnt >= scnt and lcnt >= 4:
+        direction, count, criteria = "LONG", lcnt, lc
+    elif scnt >= 4:
+        direction, count, criteria = "SHORT", scnt, sc2
     else:
-        # Nincs eleg jelzes
-        direction = None
-        count = max(long_count, short_count)
-        criteria = long_criteria if long_count >= short_count else short_criteria
+        direction, count = None, max(lcnt, scnt)
+        criteria = lc if lcnt >= scnt else sc2
 
-    if count >= 6:
-        score = 100
-        label = "GOLDEN SETUP"
-    elif count == 5:
-        score = 80
-        label = "STRONG SETUP"
-    elif count == 4:
-        score = 60
-        label = "WEAK SETUP"
-    else:
-        score = 0
-        label = "NO SETUP"
+    if count >= 6: score, label = 100, "GOLDEN SETUP"
+    elif count == 5: score, label = 80, "STRONG SETUP"
+    elif count == 4: score, label = 60, "WEAK SETUP"
+    else: score, label = 0, "NO SETUP"
 
-    # Jelzesek szoveg
-    signals = []
-    for k, v in criteria.items():
-        icon = "V" if v else "X"
-        names = {
-            "sma_golden": "SMA50 > SMA200 (golden cross)",
-            "sma_death": "SMA50 < SMA200 (death cross)",
-            "adx_strong": f"ADX {adx_val:.0f} > 25 (eros trend)",
-            "rsi_pullback": f"RSI {rsi_val:.0f} pullback 40-50 (volt 60+)",
-            "rsi_rally": f"RSI {rsi_val:.0f} rally 50-60 (volt <40)",
-            "macd_turn": "MACD histogram fordulas",
-            "obv_rising": "OBV emelkedo (10 nap)",
-            "obv_falling": "OBV csokken (10 nap)",
-            "rvol_confirm": f"RVOL {rvol:.2f}x (>1.5x)",
-        }
-        signals.append(f"  {icon} {names.get(k, k)}")
+    nl = {"sma_trend": "SMA50 > SMA200", "adx_strong": f"ADX {adx_val:.0f} > 25",
+          "rsi_pullback": f"RSI {rsi_val:.0f} pullback 40-50", "macd_turn": "MACD bull fordulas",
+          "obv_trend": "OBV emelkedo (10d)", "rvol": f"RVOL {rvol:.1f}x (>=1.5)"}
+    ns = {"sma_trend": "SMA50 < SMA200", "adx_strong": f"ADX {adx_val:.0f} > 25",
+          "rsi_pullback": f"RSI {rsi_val:.0f} rally 50-60", "macd_turn": "MACD bear fordulas",
+          "obv_trend": "OBV csokken (10d)", "rvol": f"RVOL {rvol:.1f}x (>=1.5)"}
+    nm = nl if direction != "SHORT" else ns
+    signals = [f"  {'V' if v else 'X'} {nm.get(k,k)}" for k, v in criteria.items()]
 
-    return {
-        "score": score, "direction": direction, "count": count,
-        "label": label, "criteria": criteria, "signals": signals,
-        "rvol": rvol, "adx": adx_val, "rsi": rsi_val,
-    }
+    # --- KONFIDENCIA ---
+    conf = 0
+    conf_d = []
+    skip = False
+
+    if score >= 60 and direction:
+        ichi = analyze_ichimoku(df)
+        ib, ibr = ichi.get("bull", 0), ichi.get("bear", 0)
+        if (direction == "LONG" and ib >= 4) or (direction == "SHORT" and ibr >= 4):
+            conf += 15; conf_d.append(f"V Ichimoku {max(ib,ibr)}/5 tamogat (+15)")
+        elif (direction == "LONG" and ibr >= 5) or (direction == "SHORT" and ib >= 5):
+            conf -= 25; conf_d.append("X Ichimoku 5/5 ELLENTMOND (-25)")
+
+        bb = analyze_bollinger(df)
+        if any("SQUEEZE" in s for s in bb.get("signals", [])):
+            conf += 10; conf_d.append("V BB Squeeze aktiv (+10)")
+        wu = any("FELFELE" in s for s in bb.get("signals", []))
+        wd = any("LEFELE" in s for s in bb.get("signals", []))
+        if (direction == "LONG" and wd) or (direction == "SHORT" and wu):
+            conf -= 20; conf_d.append("X BB Walk ellentmond (-20)")
+
+        sr = get_sr_levels(df)
+        if direction == "LONG":
+            sups = [l for l in sr if l < c and (c - l) / c < 0.02]
+            if sups: conf += 10; conf_d.append(f"V Tamasz kozel ({_P(max(sups))}) (+10)")
+        else:
+            ress = [l for l in sr if l > c and (l - c) / c < 0.02]
+            if ress: conf += 10; conf_d.append(f"V Ellenallas kozel ({_P(min(ress))}) (+10)")
+
+        fib = calc_fibonacci_retracement(df)
+        for fn, fv in fib.items():
+            if abs(c - fv) / c < 0.015:
+                conf += 5; conf_d.append(f"V Fib szint: {fn} (+5)"); break
+
+        _, _, _, pen, _ = calc_swing_score(df, sr)
+        if pen > 30: skip = True; conf_d.append(f"X PUMP penalty {pen} (SKIP)")
+
+        if len(df) >= 15:
+            tr = pd.concat([df["high"]-df["low"], (df["high"]-df["close"].shift()).abs(),
+                           (df["low"]-df["close"].shift()).abs()], axis=1).max(axis=1)
+            ap = float(tr.rolling(14).mean().iloc[-1] / c * 100) if c > 0 else 0
+            if ap > 10: conf -= 15; conf_d.append(f"X ATR {ap:.1f}% > 10% (-15)")
+
+    fs = max(0, score + conf)
+    if skip: dec = "NE LEPJ BE"
+    elif fs >= 100: dec = "PERFEKT SETUP — azonnal belepj"
+    elif fs >= 85: dec = "EROS SETUP — magas konfidencia"
+    elif fs >= 70: dec = "KOZEPES SETUP — ovatosan"
+    elif fs >= 60: dec = "GYENGE SETUP — varj megerositesre"
+    else: dec = "NE LEPJ BE"
+
+    return {"score": score, "final_score": fs, "direction": direction,
+            "count": count, "label": label, "criteria": criteria,
+            "signals": signals, "confidence": conf_d, "conf": conf,
+            "rvol": rvol, "adx": adx_val, "rsi": rsi_val,
+            "decision": dec, "skip": skip}
 
 
-def run_golden_scan(days: int, interval: str, quote: str,
-                    min_volume: float) -> None:
-    """Golden Setup scanner — csak 4/6+ matcheket mutat."""
+def run_golden_scan(days: int, interval: str, quote: str, min_volume: float) -> None:
+    """Golden Setup scanner + konfidencia."""
     import time as _time
-    B = Fore.CYAN + Style.BRIGHT
-    G = Fore.GREEN + Style.BRIGHT
-    R = Fore.RED + Style.BRIGHT
-    Y = Fore.YELLOW + Style.BRIGHT
-    D = Style.RESET_ALL
+    B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
 
-    print(f"\n{B}{'=' * 75}")
-    print(f" GOLDEN SETUP SCANNER")
-    print(f"{'=' * 75}{D}")
-    print(f"  Min volume: ${min_volume:,.0f} | Min match: 4/6")
-
-    all_symbols = scan_binance_top_pairs(quote, min_volume, limit=0)
-    print(f"  Szurt parok: {len(all_symbols)}\n")
+    print(f"\n{B}{'='*75}\n GOLDEN SETUP SCANNER\n{'='*75}{D}")
+    print(f"  Min volume: ${min_volume:,.0f} | 6 kriterium + konfidencia")
+    all_sym = scan_binance_top_pairs(quote, min_volume, limit=0)
+    print(f"  Szurt parok: {len(all_sym)}\n")
 
     results = []
-    total = len(all_symbols)
-
-    for idx, sym in enumerate(all_symbols):
-        if (idx + 1) % 10 == 0 or idx == total - 1:
-            print(f"\r  Szkenneles... {idx+1}/{total} ({(idx+1)/total*100:.0f}%)   ",
-                  end="", flush=True)
+    for idx, sym in enumerate(all_sym):
+        if (idx+1) % 10 == 0 or idx == len(all_sym)-1:
+            print(f"\r  Szkenneles... {idx+1}/{len(all_sym)} ({(idx+1)/len(all_sym)*100:.0f}%)   ", end="", flush=True)
         try:
-            df = fetch_binance_data(sym, days=days, interval=interval,
-                                   quote=quote, quiet=True)
-            if len(df) < 52:
-                continue
+            df = fetch_binance_data(sym, days=days, interval=interval, quote=quote, quiet=True)
+            if len(df) < 52: continue
             df = add_all_indicators(df)
-
-            # Pump filter
-            _, _, _, penalty, _ = calc_swing_score(df, [])
-            if penalty >= 20:
-                continue
-
             gs = detect_golden_setup(df)
-            if gs["score"] >= 60:
-                gs["symbol"] = sym
-                gs["close"] = float(df["close"].iloc[-1])
-                gs["df"] = df
+            if gs["score"] >= 60 and not gs["skip"]:
+                gs["symbol"] = sym; gs["close"] = float(df["close"].iloc[-1]); gs["df"] = df
                 results.append(gs)
-
             _time.sleep(0.1)
-        except Exception:
-            continue
+        except Exception: continue
 
-    print(f"\r  Szkenneles... {total}/{total} (100%) - KESZ!         \n")
+    print(f"\r  Szkenneles... {len(all_sym)}/{len(all_sym)} (100%) - KESZ!         \n")
+    results.sort(key=lambda x: x["final_score"], reverse=True)
 
-    # Tabla
-    results.sort(key=lambda x: x["score"], reverse=True)
-    goldens = [r for r in results if r["score"] == 100]
-    strongs = [r for r in results if r["score"] == 80]
-    weaks = [r for r in results if r["score"] == 60]
-
-    print(f"  Talalatok: {len(goldens)} GOLDEN | {len(strongs)} STRONG | {len(weaks)} WEAK\n")
+    gldn = sum(1 for r in results if r["score"]==100)
+    strg = sum(1 for r in results if r["score"]==80)
+    weak = sum(1 for r in results if r["score"]==60)
+    print(f"  Talalatok: {gldn} GOLDEN | {strg} STRONG | {weak} WEAK\n")
 
     if not results:
-        print(f"  {Y}Nincs Golden Setup jelolt ma.{D}")
-        return
+        print(f"  {Y}Nincs Golden Setup jelolt ma.{D}"); return
 
-    print(f"{'=' * 85}")
-    print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Label':>14}{'Match':>7}{'Dir':>7}"
-          f"{'RSI':>7}{'ADX':>7}{'RVOL':>7}")
-    print(f"{'-' * 85}")
+    print(f"{'='*95}")
+    print(f"  {'#':<4}{'Coin':<14}{'Ar':>12}{'Label':>14}{'Match':>6}{'Conf':>6}{'Final':>7}{'Dir':>7}{'RSI':>6}{'RVOL':>6}  {'Dontes'}")
+    print(f"{'-'*95}")
     for i, r in enumerate(results[:20]):
-        d = r.get("direction", "?")
-        d_str = G + d + D if d == "LONG" else (R + d + D if d == "SHORT" else d)
-        label = r["label"]
-        lc = G if "GOLDEN" in label else (Y if "STRONG" in label else D)
-        print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}"
-              f"  {lc}{label:<12}{D}{r['count']}/6"
-              f"  {d_str}"
-              f"{r['rsi']:>7.0f}{r['adx']:>7.0f}{r['rvol']:>6.1f}x")
-    print(f"{'=' * 85}")
+        d = r.get("direction","?")
+        ds = G+d+D if d=="LONG" else (R+d+D if d=="SHORT" else d)
+        lc2 = G if "GOLDEN" in r["label"] else (Y if "STRONG" in r["label"] else D)
+        fc = G if r["final_score"]>=85 else (Y if r["final_score"]>=70 else D)
+        print(f"  {i+1:<4}{r['symbol']:<14}${r['close']:>10,.4g}  {lc2}{r['label']:<12}{D}{r['count']}/6{r['conf']:>+5}  {fc}{r['final_score']:>4}{D}  {ds}{r['rsi']:>6.0f}{r['rvol']:>5.1f}x  {r['decision'][:30]}")
+    print(f"{'='*95}")
 
-    # Top 3 reszletes
-    for r in results[:3]:
-        sym = r["symbol"]
-        d = r.get("direction", "?")
-        print(f"\n{B}--- {r['label']}: {sym} ({d}) ---{D}")
-        for s in r["signals"]:
-            print(s)
-        print()
-
+    for r in results[:5]:
+        dc = G if r.get("direction")=="LONG" else R
+        print(f"\n{B}{'='*70}\n GOLDEN SETUP: {r['symbol']}\n{'='*70}{D}")
+        print(f"  Elsoedleges: {r['count']}/6 | Score: {r['score']}")
+        for s in r["signals"]: print(s)
+        if r["confidence"]:
+            print(f"\n  Masodlagos: {r['conf']:+d} konfidencia")
+            for cd in r["confidence"]: print(f"  {cd}")
+        print(f"\n  {dc}FINAL SCORE: {r['final_score']} -> {r['decision']}{D}")
 
 
 # ============================================================================
