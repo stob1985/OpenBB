@@ -318,9 +318,19 @@ def scan_binance_top_pairs(
     limit=0: osszes par (exchangeInfo-val), limit>0: top N."""
     # ExchangeInfo a valid szimbolumokhoz
     valid = _get_valid_usdt_symbols()
-    resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=15)
-    resp.raise_for_status()
-    tickers = resp.json()
+    import time as _tr
+    tickers = []
+    for _retry in range(4):
+        try:
+            resp = requests.get(f"{BINANCE_BASE_URL}/ticker/24hr", timeout=20)
+            resp.raise_for_status()
+            tickers = resp.json()
+            break
+        except Exception:
+            if _retry < 3:
+                _tr.sleep(2 ** (_retry + 1))
+            else:
+                return []
     usdt_pairs = []
     for t in tickers:
         sym = t["symbol"]
