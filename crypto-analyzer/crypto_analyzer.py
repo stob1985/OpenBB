@@ -4341,14 +4341,16 @@ def detect_golden_setup(df: pd.DataFrame) -> dict:
             "decision": dec, "skip": skip}
 
 
-def run_golden_scan(days: int, interval: str, quote: str, min_volume: float) -> None:
+def run_golden_scan(days: int, interval: str, quote: str, min_volume: float,
+                    top_n: int = 0) -> None:
     """Golden Setup scanner + konfidencia."""
     import time as _time
     B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
 
     print(f"\n{B}{'='*75}\n GOLDEN SETUP SCANNER\n{'='*75}{D}")
-    print(f"  Min volume: ${min_volume:,.0f} | 6 kriterium + konfidencia")
-    all_sym = scan_binance_top_pairs(quote, min_volume, limit=0)
+    label = f"Top {top_n}" if top_n > 0 else f"Min vol ${min_volume:,.0f}"
+    print(f"  {label} | 6 kriterium + konfidencia")
+    all_sym = scan_binance_top_pairs(quote, min_volume, limit=top_n)
     print(f"  Szurt parok: {len(all_sym)}\n")
 
     results = []
@@ -4561,14 +4563,16 @@ def smart_route(df: pd.DataFrame, symbol: str, quote: str = "USDT") -> dict:
     return result
 
 
-def run_smart_scan(days: int, interval: str, quote: str, min_volume: float) -> None:
+def run_smart_scan(days: int, interval: str, quote: str, min_volume: float,
+                   top_n: int = 0) -> None:
     """Smart scan: trend-alapu strategia hozzarendeles minden coinhoz."""
     import time as _time
     B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
 
     print(f"\n{B}{'='*75}\n SMART STRATEGY SCANNER\n{'='*75}{D}")
-    print(f"  Bullish -> Golden Long | Bearish -> Inv Golden/Breakout Short | Neutral -> Squeeze")
-    all_sym = scan_binance_top_pairs(quote, min_volume, limit=0)
+    label = f"Top {top_n}" if top_n > 0 else f"Min vol ${min_volume:,.0f}"
+    print(f"  {label} | Bullish -> Golden Long | Bearish -> Inv Golden/Breakout Short | Neutral -> Squeeze")
+    all_sym = scan_binance_top_pairs(quote, min_volume, limit=top_n)
     print(f"  Szurt parok: {len(all_sym)}\n")
 
     bull_results, bear_results, neutral_results = [], [], []
@@ -4687,6 +4691,8 @@ def main() -> None:
                         help="Golden Setup scanner: 6 felteteles jelzes detektor")
     parser.add_argument("--scan-smart", action="store_true",
                         help="Smart Strategy Scanner: trend-alapu automatikus strategia")
+    parser.add_argument("--top", type=int, default=0,
+                        help="Top N coin 24h volume szerint (pl. --top 200)")
     parser.add_argument("--min-volume", type=float, default=1_000_000,
                         help="Minimum 24h volume USD-ben")
     parser.add_argument("--min-short-score", type=float, default=60,
@@ -4734,12 +4740,17 @@ def main() -> None:
           + (f" | Interval: {args.interval}" if source in ("binance", "alpha") else
              f" | Provider: {args.provider}"))
 
+    # Top N override: ha --top megvan, min_volume-ot 0-ra allitjuk
+    # es a scan_binance_top_pairs limit parameteret hasznaljuk
+    _top_n = args.top
+    _min_vol = args.min_volume if _top_n == 0 else 0
+
     if args.scan_golden:
-        run_golden_scan(args.days, args.interval, args.quote, args.min_volume)
+        run_golden_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n)
         return
 
     if args.scan_smart:
-        run_smart_scan(args.days, args.interval, args.quote, args.min_volume)
+        run_smart_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n)
         return
 
     if args.scan_all:
