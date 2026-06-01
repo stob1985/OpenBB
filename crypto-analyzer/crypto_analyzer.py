@@ -5078,6 +5078,16 @@ def main() -> None:
     # Liquidation Map + Event Database
     parser.add_argument("--liq-map", default=None,
                         help="Likvidacios terkep egy coinhoz (pl. BTCUSDT)")
+    parser.add_argument("--htf-levels", action="store_true",
+                        help="Magasabb timeframe (1D) likvidacios szintek is")
+    parser.add_argument("--zone-width", type=float, default=0.3,
+                        choices=[0.1, 0.2, 0.3, 0.5],
+                        help="Klaszter zona ATR szorzo (szukebb=pontosabb, szeles=tobb talalt)")
+    parser.add_argument("--piv-count", type=int, default=5,
+                        choices=[5, 10, 15],
+                        help="Pivot szintek szama a likvidacios terkephez")
+    parser.add_argument("--tf", default=None, choices=["1H", "2H", "4H", "1D"],
+                        help="Multi-timeframe liq map: kulon TF (1H/2H/4H/1D)")
     parser.add_argument("--event-stats", default=None,
                         help="Statisztikai event elemzes egy coinhoz")
     parser.add_argument("--build-event-db", action="store_true",
@@ -5101,7 +5111,10 @@ def main() -> None:
         df = add_all_indicators(df)
         price = float(df["close"].iloc[-1])
         atr = _calc_atr(df) if len(df) >= 15 else 0
-        lm = _liqmod.analyze_liquidation_map(args.liq_map, price, atr, df=df)
+        lm = _liqmod.analyze_liquidation_map(
+            args.liq_map, price, atr, df=df,
+            htf_levels=args.htf_levels, zone_width=args.zone_width,
+            piv_count=args.piv_count, tf=args.tf)
         _liqmod.print_liquidation_map(args.liq_map, lm)
         return
 
