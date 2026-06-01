@@ -476,10 +476,18 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None,
     }
 
 
-def print_event_forecast(symbol: str, ev: dict, price: float = 0, atr_pct: float = 0) -> None:
-    """Event forecast kiiras (tablazatos)."""
+def print_event_forecast(symbol: str, ev: dict, price: float = 0, atr_pct: float = 0,
+                         adv_lines: list | None = None) -> None:
+    """Event forecast kiiras (tablazatos).
+
+    adv_lines: opcionalis Fazis-3 fejlec sorok a cim alatt (advisor/regime/session...).
+    """
     print(f"\n STATISTICAL EVENT FORECAST — {symbol}")
-    print(f"{'-' * 72}")
+    print(f"{'=' * 72}")
+    if adv_lines:
+        for ln in adv_lines:
+            print(ln)
+        print(f"{'-' * 72}")
     if not ev["active_stats"]:
         print("  Nincs eleg adat event elemzeshez.")
         return

@@ -46,6 +46,10 @@ try:
     import event_database as _evmod
 except Exception:
     _evmod = None
+try:
+    import advanced_features as _advmod
+except Exception:
+    _advmod = None
 
 colorama_init(autoreset=True)
 
@@ -1842,7 +1846,8 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
                   binance_extra: dict | None = None,
                   mtf_result: dict | None = None,
                   with_liq_map: bool = False,
-                  with_events: bool = False) -> dict:
+                  with_events: bool = False,
+                  advisor_mode: str = "NORMAL") -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
     close = last["close"]
@@ -2066,15 +2071,29 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         except Exception:
             lm = None
 
-    # ---- EVENT FORECAST ----
+    # ---- EVENT FORECAST + ADVANCED HEADER (Fazis 3) ----
     ev_edge = 0
     evr = None
+    regime = None
+    corr = None
     if with_events and _evmod is not None:
         try:
             stats = _evmod.load_event_stats(symbol)
             evr = _evmod.analyze_events(df, symbol, stats)
+            # Advanced fejlec (Fazis 3): regime, session, vol, correlation
+            adv_lines = None
+            if _advmod is not None:
+                regime = _advmod.detect_market_regime(df)
+                mtf_sc = mtf_score_modifier(mtf_result) if mtf_result else 0
+                try:
+                    _advmod.record_prediction(symbol, evr.get("up_pct", 50), float(close))
+                    corr = _advmod.resolve_and_correlate(symbol, df)
+                except Exception:
+                    corr = None
+                adv_lines = _advmod.advanced_header_lines(
+                    symbol, regime, advisor_mode, pos["volatility_pct"], mtf_sc, corr, df)
             print(f"\n{M}", end="")
-            _evmod.print_event_forecast(symbol, evr, close, pos["volatility_pct"])
+            _evmod.print_event_forecast(symbol, evr, close, pos["volatility_pct"], adv_lines)
             print(D, end="")
             ev_edge = evr["edge_score"] if evr["edge"] == ("LONG" if score >= 50 else "SHORT") else 0
         except Exception:
@@ -2085,7 +2104,8 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         try:
             gs = detect_golden_setup(df)
             atr_pct = pos.get("volatility_pct", 0) or 0
-            cd = combined_decision(gs, lm, evr, atr_pct)
+            cd = combined_decision(gs, lm, evr, atr_pct,
+                                   advisor_mode=advisor_mode, regime=regime, corr=corr)
             print_combined_decision(symbol, cd)
         except Exception:
             pass
@@ -2108,7 +2128,8 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
 def run_scanner(symbols: list, days: int, source: str, provider: str,
                 interval: str, quote: str,
                 detail_threshold: float = 0, use_mtf: bool = False,
-                with_liq_map: bool = False, with_events: bool = False) -> None:
+                with_liq_map: bool = False, with_events: bool = False,
+                advisor_mode: str = "NORMAL") -> None:
     """detail_threshold: csak ez feletti score-nal ad reszletes elemzest + chartot."""
     results = []
     for sym in symbols:
@@ -2156,7 +2177,8 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                 })
                 continue
             info = print_summary(df, sym, sr, binance_extra, mtf_result=mtf,
-                                  with_liq_map=with_liq_map, with_events=with_events)
+                                  with_liq_map=with_liq_map, with_events=with_events,
+                                  advisor_mode=advisor_mode)
             if mtf:
                 info["mtf"] = f"{mtf['bull_count']}/4"
             plot_chart(df, sym, sr)
@@ -4394,26 +4416,29 @@ def detect_golden_setup(df: pd.DataFrame) -> dict:
 
 
 def combined_decision(gs: dict, lm: dict | None = None, ev: dict | None = None,
-                      atr_pct: float = 0.0) -> dict:
-    """KOMBINALT DONTESI MOTOR — max 190 pont.
+                      atr_pct: float = 0.0, advisor_mode: str = "NORMAL",
+                      regime: str | None = None, corr: dict | None = None) -> dict:
+    """KOMBINALT DONTESI MOTOR — max 190 pont (Fazis 3 advisor + regime vetokkal).
 
     Final Score = Golden Setup (100) + Masodlagos megerosites (40)
                   + Liquidation Map edge (25) + Event Database edge (25).
 
     Dontesi matrix:
-      170+  LEGENDARY
-      150-169  PERFECT
-      130-149  STRONG
-      110-129  GOOD
-      90-109   MEDIUM
-      <90      NE LEPJ BE
+      170+  LEGENDARY / 150-169 PERFECT / 130-149 STRONG /
+      110-129 GOOD / 90-109 MEDIUM / <90 NE LEPJ BE
 
     Kotelezo vetok:
-      - barmely komponens VEGYES/NEUTRAL  -> max 100
-      - Event WR_5d <= 50%                -> NE LEPJ BE
-      - ATR > 12%                         -> csak kis pozicio
-      - Liq Map PROXY mod                 -> -10 pont
+      - barmely komponens VEGYES/NEUTRAL          -> max 100
+      - Event iranyfuggo WR_5d <= 50%             -> NE LEPJ BE
+      - ATR > advisor max_atr                     -> csak kis pozicio
+      - Liq Map PROXY mod                         -> -10 pont
+      - Composite Q < advisor min_data_quality    -> max 100
+      - Correlation < 0                           -> NE LEPJ BE
+      - Regime != preferred irany                 -> -20 pont
+      - Final < advisor min_score                 -> NE LEPJ BE
     """
+    adv = _advmod.advisor_settings(advisor_mode) if _advmod else {
+        "min_score": 100, "min_data_quality": 70, "max_atr": 10}
     direction = gs.get("direction")
     base = gs.get("score", 0)               # 0/60/80/100
     secondary = max(0, gs.get("conf", 0))   # max ~40
@@ -4468,18 +4493,53 @@ def combined_decision(gs: dict, lm: dict | None = None, ev: dict | None = None,
                 hard_block = True
                 vetoes.append(f"Event iranyfuggo WR_5d <= 50% ({best_dir_wr:.0f}%) -> NE LEPJ BE")
 
-    # ATR > 12% -> csak kis pozicio
+    # ATR > advisor max_atr -> csak kis pozicio
     position = "NORMAL"
-    if atr_pct > 12:
+    max_atr = adv.get("max_atr", 10)
+    if atr_pct > max_atr:
         position = "KIS POZICIO"
-        notes.append(f"ATR {atr_pct:.1f}% > 12% -> csak kis pozicio")
+        notes.append(f"ATR {atr_pct:.1f}% > {max_atr}% ({advisor_mode}) -> csak kis pozicio")
+
+    # --- FAZIS 3 VETOK ---
+    # Composite Q < advisor min_data_quality -> max 100
+    comp_q = ev.get("avg_quality", 0) if ev else 0
+    min_dq = adv.get("min_data_quality", 70)
+    if ev is not None and comp_q < min_dq:
+        if final > 100:
+            final = 100
+        vetoes.append(f"Composite Q {comp_q} < {min_dq} ({advisor_mode}) -> max 100")
+
+    # Correlation < 0 -> NE LEPJ BE
+    if corr and corr.get("corr") is not None and corr["corr"] < 0:
+        hard_block = True
+        vetoes.append(f"Correlation {corr['corr']:+d}% < 0 -> HIBAS modell, NE LEPJ BE")
+
+    # Regime != preferred irany -> -20
+    if regime and direction and _advmod is not None:
+        pref = _advmod.regime_settings(regime).get("preferred_dir")
+        if pref is not None and pref != direction:
+            final -= 20
+            notes.append(f"Regime {regime} preferalt iranya {pref} != {direction} (-20)")
+        # HIGH_VOL: fel pozicio
+        if regime == "HIGH_VOL" and position == "NORMAL":
+            position = "KIS POZICIO"
+            notes.append("HIGH_VOL regime -> fel pozicio")
 
     final = max(0, final)
+
+    # Advisor min_score gate
+    if not hard_block and final < adv.get("min_score", 100):
+        below_gate = True
+    else:
+        below_gate = False
 
     # Dontesi matrix
     if hard_block:
         decision = "NE LEPJ BE (veto)"
         tier = "VETO"
+    elif below_gate:
+        decision = f"NE LEPJ BE ({advisor_mode} kuszob: {adv.get('min_score')})"
+        tier = "BELOW_GATE"
     elif final >= 170:
         decision, tier = "LEGENDARY — maximalis konviccio", "LEGENDARY"
     elif final >= 150:
@@ -4500,6 +4560,7 @@ def combined_decision(gs: dict, lm: dict | None = None, ev: dict | None = None,
         "liq_dir": liq_dir, "ev_dir": ev_dir,
         "direction": direction, "position": position,
         "vetoes": vetoes, "notes": notes,
+        "advisor_mode": advisor_mode, "regime": regime,
     }
 
 
@@ -4514,6 +4575,8 @@ def print_combined_decision(symbol: str, cd: dict) -> None:
     dc = G if dirn == "LONG" else (R if dirn == "SHORT" else Y)
 
     print(f"\n{B}{'='*70}\n KOMBINALT DONTESI MOTOR — {symbol}\n{'='*70}{D}")
+    print(f"  Advisor: {cd.get('advisor_mode', 'NORMAL')} | Regime: {cd.get('regime') or 'n/a'}")
+    print(f"  {'-'*50}")
     print(f"  Golden Setup base   : {cd['base']:>4} / 100")
     print(f"  Masodlagos megerosites: {cd['secondary']:>+4} / 40")
     print(f"  Liquidation Map edge: {cd['liq_pts']:>+4} / 25  ({cd['liq_dir']})")
@@ -4536,7 +4599,8 @@ def print_combined_decision(symbol: str, cd: dict) -> None:
 
 
 def run_golden_scan(days: int, interval: str, quote: str, min_volume: float,
-                    top_n: int = 0, combined: bool = False) -> None:
+                    top_n: int = 0, combined: bool = False,
+                    advisor_mode: str = "NORMAL") -> None:
     """Golden Setup scanner + konfidencia.
 
     combined=True eseten a top-5 jeloltre lefuttatja a kombinalt dontesi
@@ -4619,14 +4683,27 @@ def run_golden_scan(days: int, interval: str, quote: str, min_volume: float,
                         _liqmod.print_liquidation_map(r["symbol"], lm)
                     except Exception:
                         lm = None
+                regime = None
+                corr = None
                 if _evmod is not None:
                     try:
                         stats = _evmod.load_event_stats(r["symbol"])
                         ev = _evmod.analyze_events(rdf, r["symbol"], stats)
-                        _evmod.print_event_forecast(r["symbol"], ev, c, atr_pct)
+                        adv_lines = None
+                        if _advmod is not None:
+                            regime = _advmod.detect_market_regime(rdf)
+                            try:
+                                _advmod.record_prediction(r["symbol"], ev.get("up_pct", 50), c)
+                                corr = _advmod.resolve_and_correlate(r["symbol"], rdf)
+                            except Exception:
+                                corr = None
+                            adv_lines = _advmod.advanced_header_lines(
+                                r["symbol"], regime, advisor_mode, atr_pct, 0, corr, rdf)
+                        _evmod.print_event_forecast(r["symbol"], ev, c, atr_pct, adv_lines)
                     except Exception:
                         ev = None
-            cd = combined_decision(r, lm, ev, atr_pct)
+            cd = combined_decision(r, lm, ev, atr_pct, advisor_mode=advisor_mode,
+                                   regime=regime, corr=corr)
             print_combined_decision(r["symbol"], cd)
 
 
@@ -4793,7 +4870,8 @@ def smart_route(df: pd.DataFrame, symbol: str, quote: str = "USDT") -> dict:
 
 
 def run_smart_scan(days: int, interval: str, quote: str, min_volume: float,
-                   top_n: int = 0) -> None:
+                   top_n: int = 0, with_liq_map: bool = False,
+                   with_events: bool = False, advisor_mode: str = "NORMAL") -> None:
     """Smart scan: trend-alapu strategia hozzarendeles minden coinhoz."""
     import time as _time
     B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
@@ -4889,6 +4967,47 @@ def run_smart_scan(days: int, interval: str, quote: str, min_volume: float,
             tc = G if r["trend"]=="BULLISH" else (R if r["trend"]=="BEARISH" else Y)
             print(f"  {i+1}. {r['symbol']:<12} {tc}{r['trend']:<8}{D} {r['strategy']:<18} Final: {r['final_score']:>4}  {d.get('decision','')[:35]}")
 
+        # --- KOMBINALT DONTESI MOTOR a top-5-re (ha kertek a modulokat) ---
+        if with_liq_map or with_events:
+            for r in all_r[:5]:
+                gs = r["det"]
+                rdf = r.get("df")
+                if rdf is None:
+                    continue
+                c = float(rdf["close"].iloc[-1])
+                tr = pd.concat([rdf["high"]-rdf["low"],
+                                (rdf["high"]-rdf["close"].shift()).abs(),
+                                (rdf["low"]-rdf["close"].shift()).abs()], axis=1).max(axis=1)
+                atr_abs = float(tr.rolling(14).mean().iloc[-1]) if len(rdf) >= 15 else c*0.02
+                atr_pct = atr_abs / c * 100 if c > 0 else 0
+                lm = ev = regime = corr = None
+                if with_liq_map and _liqmod is not None:
+                    try:
+                        lm = _liqmod.analyze_liquidation_map(r["symbol"], c, atr_abs, df=rdf)
+                        _liqmod.print_liquidation_map(r["symbol"], lm)
+                    except Exception:
+                        lm = None
+                if with_events and _evmod is not None:
+                    try:
+                        stats = _evmod.load_event_stats(r["symbol"])
+                        ev = _evmod.analyze_events(rdf, r["symbol"], stats)
+                        adv_lines = None
+                        if _advmod is not None:
+                            regime = _advmod.detect_market_regime(rdf)
+                            try:
+                                _advmod.record_prediction(r["symbol"], ev.get("up_pct", 50), c)
+                                corr = _advmod.resolve_and_correlate(r["symbol"], rdf)
+                            except Exception:
+                                corr = None
+                            adv_lines = _advmod.advanced_header_lines(
+                                r["symbol"], regime, advisor_mode, atr_pct, 0, corr, rdf)
+                        _evmod.print_event_forecast(r["symbol"], ev, c, atr_pct, adv_lines)
+                    except Exception:
+                        ev = None
+                cd = combined_decision(gs, lm, ev, atr_pct, advisor_mode=advisor_mode,
+                                       regime=regime, corr=corr)
+                print_combined_decision(r["symbol"], cd)
+
 
 # ============================================================================
 # 17. FOPROGRAM
@@ -4969,6 +5088,9 @@ def main() -> None:
                         help="Event statisztika beepitese az elemzesbe")
     parser.add_argument("--combined", action="store_true",
                         help="Kombinalt dontesi motor (Golden+Liq+Event, max 190) a golden scan top-5-re")
+    parser.add_argument("--advisor-mode", default="NORMAL",
+                        choices=["CONSERVATIVE", "NORMAL", "AGGRESSIVE"],
+                        help="Advisor mod: szigorubb/lazabb belepesi kuszobok (Fazis 3)")
     args = parser.parse_args()
 
     # --- Liquidation Map / Event standalone parancsok ---
@@ -5031,11 +5153,13 @@ def main() -> None:
 
     if args.scan_golden:
         run_golden_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n,
-                        combined=args.combined)
+                        combined=args.combined, advisor_mode=args.advisor_mode)
         return
 
     if args.scan_smart:
-        run_smart_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n)
+        run_smart_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n,
+                       with_liq_map=args.with_liq_map, with_events=args.with_events,
+                       advisor_mode=args.advisor_mode)
         return
 
     if args.scan_all:
@@ -5083,7 +5207,8 @@ def main() -> None:
                 detail_threshold=args.detail_threshold,
                 use_mtf=args.mtf,
                 with_liq_map=args.with_liq_map,
-                with_events=args.with_events)
+                with_events=args.with_events,
+                advisor_mode=args.advisor_mode)
 
 
 if __name__ == "__main__":
