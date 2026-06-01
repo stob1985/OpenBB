@@ -15,6 +15,52 @@ import pandas as pd
 
 EVENT_DB_DIR = "results/event_db"
 
+# Adaptiv sulyok eventtipusonkent (backteszttel optimalizalhato)
+ADAPTIVE_WEIGHTS = {
+    "RSI_OS": 1.52, "RSI_OS_36": 1.52, "RSI_OB": 1.52, "RSI_OB_64": 1.52,
+    "Vol_Spike": 1.04,
+    "MACD_Bull_Cross": 1.3, "MACD_Bear_Cross": 1.3,
+    "Golden_Cross": 2.4, "Death_Cross": 2.4,
+    "BB_Break_Up": 1.2, "BB_Break_Down": 1.2,
+    "Friday": 0.8, "Saturday": 0.8, "Sunday": 0.8, "Month_End": 0.8,
+    "No_Streak": 1.5,
+}
+
+
+def detect_regime(df: pd.DataFrame) -> str:
+    """Piaci rezsim: BULL / BEAR / VOLATILE / NORMAL."""
+    if len(df) < 30:
+        return "NORMAL"
+    close = df["close"]
+    tr = (df["high"] - df["low"])
+    atr = tr.rolling(14).mean()
+    if atr.iloc[-30:].mean() > 0 and atr.iloc[-1] > atr.iloc[-30:].mean() * 1.3:
+        return "VOLATILE"
+    chg30 = (close.iloc[-1] - close.iloc[-30]) / close.iloc[-30] * 100
+    if chg30 < -10:
+        return "BEAR"
+    if chg30 > 10:
+        return "BULL"
+    return "NORMAL"
+
+
+def _regime_rsi_thresholds(regime: str) -> tuple[float, float]:
+    """RSI OB/OS kuszobok rezsim szerint."""
+    if regime == "BEAR":
+        return 65, 25
+    if regime == "VOLATILE":
+        return 75, 20
+    return 70, 30  # NORMAL / BULL
+
+
+def classify_edge(wr5: float, avg5: float) -> str:
+    """BIAS vs EDGE megkulonboztetes: csak szignifikans elony szamit."""
+    if wr5 >= 55 and avg5 > 0.5:
+        return "UP"
+    if wr5 <= 45 and avg5 < -0.5:
+        return "DOWN"
+    return "NEUTRAL"
+
 
 def _forward_returns(close: pd.Series, idx: int, horizons=(1, 3, 5)) -> dict:
     """Forward return % az adott indextol."""
@@ -164,6 +210,7 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None) -> 
     if stats is None:
         stats = build_event_stats(df)
 
+    regime = detect_regime(df)
     # Aktiv eventek MA
     active = _detect_events(df, len(df) - 1)
     active_stats = []
@@ -180,17 +227,21 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None) -> 
         avg5 = st.get("AVG_5d", 0)
         n = st.get("n", 0)
         qual = st.get("quality", 0)
-        weight = qual / 100  # quality alapu sulyozas
-        # WR alapjan up/down
-        if wr5 > 50:
+        # Csak 50%+ data quality esemenyek szamitanak a vegso scoringba
+        edge = classify_edge(wr5, avg5)
+        # Adaptiv suly: quality * eventtipus suly
+        aw = ADAPTIVE_WEIGHTS.get(ev, 1.0)
+        weight = (qual / 100) * aw
+        # Csak ha EDGE szignifikans (nem csak BIAS)
+        if edge == "UP":
             up_score += (wr5 - 50) * weight
-        else:
+        elif edge == "DOWN":
             dn_score += (50 - wr5) * weight
         total_weight += weight
         quality_sum += qual
         active_stats.append({
             "event": ev, "WR_5d": wr5, "AVG_5d": avg5,
-            "n": n, "quality": qual,
+            "n": n, "quality": qual, "edge": edge, "weight": round(aw, 2),
         })
 
     # Composite UP%/DN%
@@ -222,11 +273,17 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None) -> 
         edge = "SHORT"
         edge_score = 10 if strength == "VERY STRONG" else (7 if strength == "STRONG" else 3)
 
+    # Forecast confidence: csak akkor ervenyes ha eleg minoseg
+    confidence = "HIGH" if avg_quality > 80 else ("MEDIUM" if avg_quality > 60 else "LOW")
+    # Veto: ha alacsony a konfidencia, az edge_score felezodik
+    if avg_quality < 60:
+        edge_score = edge_score // 2
+
     return {
         "active_stats": active_stats, "up_pct": round(up_pct, 1),
         "dn_pct": round(dn_pct, 1), "bias": bias, "strength": strength,
         "avg_quality": round(avg_quality), "edge": edge, "edge_score": edge_score,
-        "n_active": len(active_stats),
+        "n_active": len(active_stats), "regime": regime, "confidence": confidence,
     }
 
 
@@ -238,11 +295,14 @@ def print_event_forecast(symbol: str, ev: dict, price: float = 0, atr_pct: float
         print("  Nincs eleg adat event elemzeshez.")
         return
 
+    print(f"  Rezsim: {ev.get('regime', 'NORMAL')} | Confidence: {ev.get('confidence', '?')}")
     print(f"  ACTIVE EVENTS ({ev['n_active']}):")
     for st in ev["active_stats"]:
         sign = "+" if st["AVG_5d"] >= 0 else ""
+        edge = st.get("edge", "?")
+        w = st.get("weight", 1.0)
         print(f"    {st['event']:<16} WR-5d {st['WR_5d']:.1f}%, "
-              f"AVG {sign}{st['AVG_5d']:.2f}% (n={st['n']}, qual {st['quality']}%)")
+              f"AVG {sign}{st['AVG_5d']:.2f}% [{edge}, w{w}] (n={st['n']}, q{st['quality']}%)")
 
     print(f"\n  COMPOSITE: {ev['n_active']} active | Bias: {ev['bias']} ({ev['strength']}) | Q: {ev['avg_quality']}/100")
     print(f"  UP: {ev['up_pct']:.1f}% | DN: {ev['dn_pct']:.1f}%")
