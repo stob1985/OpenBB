@@ -74,21 +74,26 @@ def _forward_returns(close: pd.Series, idx: int, horizons=(1, 3, 5)) -> dict:
     return out
 
 
-def _detect_events(df: pd.DataFrame, idx: int) -> list[str]:
-    """Megnezi melyik eventek aktivak az adott napon."""
+def _detect_events(df: pd.DataFrame, idx: int,
+                   rsi_ob: float = 70, rsi_os: float = 30) -> list[str]:
+    """Megnezi melyik eventek aktivak az adott napon.
+
+    rsi_ob / rsi_os: rezsim-adaptiv RSI kuszobok (_regime_rsi_thresholds).
+    A "kozeli" savok (OS_36 / OB_64) a kuszob koruli 6 pontos savot jelolik.
+    """
     events = []
     last = df.iloc[idx]
     close = df["close"]
 
     rsi = last.get("rsi")
     if rsi is not None and pd.notna(rsi):
-        if rsi < 30:
+        if rsi < rsi_os:
             events.append("RSI_OS")
-        elif rsi < 36:
+        elif rsi < rsi_os + 6:
             events.append("RSI_OS_36")
-        elif rsi > 70:
+        elif rsi > rsi_ob:
             events.append("RSI_OB")
-        elif rsi > 64:
+        elif rsi > rsi_ob - 6:
             events.append("RSI_OB_64")
 
     # Vol spike (RVOL > 2)
@@ -151,9 +156,13 @@ def build_event_stats(df: pd.DataFrame) -> dict:
     """Minden eventre kiszamolja a forward return statisztikat."""
     event_data = {}  # event -> list of forward returns
 
+    # Rezsim-adaptiv RSI kuszobok az egesz mintara
+    regime = detect_regime(df)
+    rsi_ob, rsi_os = _regime_rsi_thresholds(regime)
+
     n = len(df)
     for idx in range(50, n - 5):  # min 50 nap warmup, 5 nap forward
-        events = _detect_events(df, idx)
+        events = _detect_events(df, idx, rsi_ob=rsi_ob, rsi_os=rsi_os)
         fwd = _forward_returns(df["close"], idx)
         for ev in events:
             if ev not in event_data:
@@ -211,8 +220,9 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None) -> 
         stats = build_event_stats(df)
 
     regime = detect_regime(df)
+    rsi_ob, rsi_os = _regime_rsi_thresholds(regime)
     # Aktiv eventek MA
-    active = _detect_events(df, len(df) - 1)
+    active = _detect_events(df, len(df) - 1, rsi_ob=rsi_ob, rsi_os=rsi_os)
     active_stats = []
     up_score = 0
     dn_score = 0
@@ -263,15 +273,15 @@ def analyze_events(df: pd.DataFrame, symbol: str, stats: dict | None = None) -> 
 
     avg_quality = quality_sum / len(active_stats) if active_stats else 0
 
-    # Edge score: max +10 (irany + erosseg alapjan)
+    # Edge score: max +25 (irany + erosseg alapjan) — kombinalt dontesi motor
     edge = "NEUTRAL"
     edge_score = 0
     if bias == "UP":
         edge = "LONG"
-        edge_score = 10 if strength == "VERY STRONG" else (7 if strength == "STRONG" else 3)
+        edge_score = 25 if strength == "VERY STRONG" else (18 if strength == "STRONG" else 8)
     elif bias == "DOWN":
         edge = "SHORT"
-        edge_score = 10 if strength == "VERY STRONG" else (7 if strength == "STRONG" else 3)
+        edge_score = 25 if strength == "VERY STRONG" else (18 if strength == "STRONG" else 8)
 
     # Forecast confidence: csak akkor ervenyes ha eleg minoseg
     confidence = "HIGH" if avg_quality > 80 else ("MEDIUM" if avg_quality > 60 else "LOW")

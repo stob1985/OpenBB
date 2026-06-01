@@ -2055,18 +2055,20 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
 
     # ---- LIQUIDATION MAP ----
     liq_edge = 0
+    lm = None
     if with_liq_map and _liqmod is not None:
         try:
-            lm = _liqmod.analyze_liquidation_map(symbol, close, atr)
+            lm = _liqmod.analyze_liquidation_map(symbol, close, atr, df=df)
             print(f"\n{M}", end="")
             _liqmod.print_liquidation_map(symbol, lm)
             print(D, end="")
             liq_edge = lm["edge_score"] if lm["edge"] == ("LONG" if score >= 50 else "SHORT") else 0
         except Exception:
-            pass
+            lm = None
 
     # ---- EVENT FORECAST ----
     ev_edge = 0
+    evr = None
     if with_events and _evmod is not None:
         try:
             stats = _evmod.load_event_stats(symbol)
@@ -2075,6 +2077,16 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
             _evmod.print_event_forecast(symbol, evr, close, pos["volatility_pct"])
             print(D, end="")
             ev_edge = evr["edge_score"] if evr["edge"] == ("LONG" if score >= 50 else "SHORT") else 0
+        except Exception:
+            evr = None
+
+    # ---- KOMBINALT DONTESI MOTOR (max 190) ----
+    if with_liq_map and with_events and (lm is not None or evr is not None):
+        try:
+            gs = detect_golden_setup(df)
+            atr_pct = pos.get("volatility_pct", 0) or 0
+            cd = combined_decision(gs, lm, evr, atr_pct)
+            print_combined_decision(symbol, cd)
         except Exception:
             pass
 
@@ -4381,9 +4393,155 @@ def detect_golden_setup(df: pd.DataFrame) -> dict:
             "decision": dec, "skip": skip}
 
 
+def combined_decision(gs: dict, lm: dict | None = None, ev: dict | None = None,
+                      atr_pct: float = 0.0) -> dict:
+    """KOMBINALT DONTESI MOTOR — max 190 pont.
+
+    Final Score = Golden Setup (100) + Masodlagos megerosites (40)
+                  + Liquidation Map edge (25) + Event Database edge (25).
+
+    Dontesi matrix:
+      170+  LEGENDARY
+      150-169  PERFECT
+      130-149  STRONG
+      110-129  GOOD
+      90-109   MEDIUM
+      <90      NE LEPJ BE
+
+    Kotelezo vetok:
+      - barmely komponens VEGYES/NEUTRAL  -> max 100
+      - Event WR_5d <= 50%                -> NE LEPJ BE
+      - ATR > 12%                         -> csak kis pozicio
+      - Liq Map PROXY mod                 -> -10 pont
+    """
+    direction = gs.get("direction")
+    base = gs.get("score", 0)               # 0/60/80/100
+    secondary = max(0, gs.get("conf", 0))   # max ~40
+
+    liq_dir = lm.get("edge", "NEUTRAL") if lm else "NEUTRAL"
+    liq_edge_raw = lm.get("edge_score", 0) if lm else 0
+    ev_dir = ev.get("edge", "NEUTRAL") if ev else "NEUTRAL"
+    ev_edge_raw = ev.get("edge_score", 0) if ev else 0
+
+    # Csak ha az edge egyezik a Golden Setup iranyaval, szamit pozitivan
+    liq_pts = liq_edge_raw if (direction and liq_dir == direction) else 0
+    ev_pts = ev_edge_raw if (direction and ev_dir == direction) else 0
+
+    final = base + secondary + liq_pts + ev_pts
+
+    vetoes = []
+    notes = []
+
+    # Liq Map PROXY mod -> -10
+    if lm and lm.get("proxy_mode"):
+        final -= 10
+        notes.append("Liq Map PROXY mod (-10)")
+
+    # VEGYES/NEUTRAL komponens -> max 100
+    neutral_components = []
+    if lm is not None and liq_dir == "NEUTRAL":
+        neutral_components.append("Liq Map")
+    if ev is not None and ev_dir == "NEUTRAL":
+        neutral_components.append("Event DB")
+    # Ellentmondo edge (a Golden iranyaval szembe) is VEGYES-nek szamit
+    if direction:
+        if lm is not None and liq_dir not in ("NEUTRAL", direction):
+            neutral_components.append("Liq Map (ellentmond)")
+        if ev is not None and ev_dir not in ("NEUTRAL", direction):
+            neutral_components.append("Event DB (ellentmond)")
+    if neutral_components:
+        if final > 100:
+            final = 100
+        vetoes.append(f"VEGYES/NEUTRAL: {', '.join(neutral_components)} -> max 100")
+
+    # Event WR_5d <= 50% -> NE LEPJ BE
+    # Iranyfuggo win rate: LONG-nal WR_5d (ar felfele), SHORT-nal 100-WR_5d (ar lefele)
+    hard_block = bool(gs.get("skip"))
+    if ev is not None and direction and ev_dir == direction:
+        want = "UP" if direction == "LONG" else "DOWN"
+        wrs = [s["WR_5d"] for s in ev.get("active_stats", []) if s.get("edge") == want]
+        if wrs:
+            # A legjobb iranyfuggo win rate
+            dir_wrs = [w if direction == "LONG" else (100 - w) for w in wrs]
+            best_dir_wr = max(dir_wrs)
+            if best_dir_wr <= 50:
+                hard_block = True
+                vetoes.append(f"Event iranyfuggo WR_5d <= 50% ({best_dir_wr:.0f}%) -> NE LEPJ BE")
+
+    # ATR > 12% -> csak kis pozicio
+    position = "NORMAL"
+    if atr_pct > 12:
+        position = "KIS POZICIO"
+        notes.append(f"ATR {atr_pct:.1f}% > 12% -> csak kis pozicio")
+
+    final = max(0, final)
+
+    # Dontesi matrix
+    if hard_block:
+        decision = "NE LEPJ BE (veto)"
+        tier = "VETO"
+    elif final >= 170:
+        decision, tier = "LEGENDARY — maximalis konviccio", "LEGENDARY"
+    elif final >= 150:
+        decision, tier = "PERFECT — azonnal belepj", "PERFECT"
+    elif final >= 130:
+        decision, tier = "STRONG — magas konfidencia", "STRONG"
+    elif final >= 110:
+        decision, tier = "GOOD — belepheto", "GOOD"
+    elif final >= 90:
+        decision, tier = "MEDIUM — ovatosan", "MEDIUM"
+    else:
+        decision, tier = "NE LEPJ BE", "NONE"
+
+    return {
+        "final": final, "decision": decision, "tier": tier,
+        "base": base, "secondary": secondary,
+        "liq_pts": liq_pts, "ev_pts": ev_pts,
+        "liq_dir": liq_dir, "ev_dir": ev_dir,
+        "direction": direction, "position": position,
+        "vetoes": vetoes, "notes": notes,
+    }
+
+
+def print_combined_decision(symbol: str, cd: dict) -> None:
+    """Kombinalt dontesi motor kiiras (max 190 pont)."""
+    B = Fore.CYAN + Style.BRIGHT
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    D = Style.RESET_ALL
+    dirn = cd.get("direction") or "?"
+    dc = G if dirn == "LONG" else (R if dirn == "SHORT" else Y)
+
+    print(f"\n{B}{'='*70}\n KOMBINALT DONTESI MOTOR — {symbol}\n{'='*70}{D}")
+    print(f"  Golden Setup base   : {cd['base']:>4} / 100")
+    print(f"  Masodlagos megerosites: {cd['secondary']:>+4} / 40")
+    print(f"  Liquidation Map edge: {cd['liq_pts']:>+4} / 25  ({cd['liq_dir']})")
+    print(f"  Event Database edge : {cd['ev_pts']:>+4} / 25  ({cd['ev_dir']})")
+    print(f"  {'-'*50}")
+
+    fc = G if cd["final"] >= 150 else (Y if cd["final"] >= 110 else R)
+    print(f"  {fc}FINAL SCORE: {cd['final']} / 190  [{cd['tier']}]{D}")
+    print(f"  {dc}IRANY: {dirn}{D} | Pozicio: {cd['position']}")
+    print(f"  {fc}=> {cd['decision']}{D}")
+
+    if cd["vetoes"]:
+        print(f"\n  {R}VETOK:{D}")
+        for v in cd["vetoes"]:
+            print(f"    {R}!{D} {v}")
+    if cd["notes"]:
+        for n in cd["notes"]:
+            print(f"    {Y}>{D} {n}")
+    print(f"{B}{'='*70}{D}")
+
+
 def run_golden_scan(days: int, interval: str, quote: str, min_volume: float,
-                    top_n: int = 0) -> None:
-    """Golden Setup scanner + konfidencia."""
+                    top_n: int = 0, combined: bool = False) -> None:
+    """Golden Setup scanner + konfidencia.
+
+    combined=True eseten a top-5 jeloltre lefuttatja a kombinalt dontesi
+    motort is (Liquidation Map + Event Database edge, max 190 pont).
+    """
     import time as _time
     B, G, R, Y, D = Fore.CYAN+Style.BRIGHT, Fore.GREEN+Style.BRIGHT, Fore.RED+Style.BRIGHT, Fore.YELLOW+Style.BRIGHT, Style.RESET_ALL
 
@@ -4439,6 +4597,37 @@ def run_golden_scan(days: int, interval: str, quote: str, min_volume: float,
             print(f"\n  Masodlagos: {r['conf']:+d} konfidencia")
             for cd in r["confidence"]: print(f"  {cd}")
         print(f"\n  {dc}FINAL SCORE: {r['final_score']} -> {r['decision']}{D}")
+
+        # --- KOMBINALT DONTESI MOTOR (max 190) ---
+        if combined:
+            rdf = r.get("df")
+            lm = ev = None
+            atr_pct = 0.0
+            if rdf is not None:
+                c = float(rdf["close"].iloc[-1])
+                if len(rdf) >= 15:
+                    tr = pd.concat([rdf["high"]-rdf["low"],
+                                    (rdf["high"]-rdf["close"].shift()).abs(),
+                                    (rdf["low"]-rdf["close"].shift()).abs()], axis=1).max(axis=1)
+                    atr_pct = float(tr.rolling(14).mean().iloc[-1] / c * 100) if c > 0 else 0
+                    atr_abs = float(tr.rolling(14).mean().iloc[-1])
+                else:
+                    atr_abs = c * 0.02
+                if _liqmod is not None:
+                    try:
+                        lm = _liqmod.analyze_liquidation_map(r["symbol"], c, atr_abs, df=rdf)
+                        _liqmod.print_liquidation_map(r["symbol"], lm)
+                    except Exception:
+                        lm = None
+                if _evmod is not None:
+                    try:
+                        stats = _evmod.load_event_stats(r["symbol"])
+                        ev = _evmod.analyze_events(rdf, r["symbol"], stats)
+                        _evmod.print_event_forecast(r["symbol"], ev, c, atr_pct)
+                    except Exception:
+                        ev = None
+            cd = combined_decision(r, lm, ev, atr_pct)
+            print_combined_decision(r["symbol"], cd)
 
 
 
@@ -4778,6 +4967,8 @@ def main() -> None:
                         help="Likvidacios terkep beepitese az elemzesbe")
     parser.add_argument("--with-events", action="store_true",
                         help="Event statisztika beepitese az elemzesbe")
+    parser.add_argument("--combined", action="store_true",
+                        help="Kombinalt dontesi motor (Golden+Liq+Event, max 190) a golden scan top-5-re")
     args = parser.parse_args()
 
     # --- Liquidation Map / Event standalone parancsok ---
@@ -4788,7 +4979,7 @@ def main() -> None:
         df = add_all_indicators(df)
         price = float(df["close"].iloc[-1])
         atr = _calc_atr(df) if len(df) >= 15 else 0
-        lm = _liqmod.analyze_liquidation_map(args.liq_map, price, atr)
+        lm = _liqmod.analyze_liquidation_map(args.liq_map, price, atr, df=df)
         _liqmod.print_liquidation_map(args.liq_map, lm)
         return
 
@@ -4839,7 +5030,8 @@ def main() -> None:
     _min_vol = args.min_volume if _top_n == 0 else 0
 
     if args.scan_golden:
-        run_golden_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n)
+        run_golden_scan(args.days, args.interval, args.quote, _min_vol, top_n=_top_n,
+                        combined=args.combined)
         return
 
     if args.scan_smart:
