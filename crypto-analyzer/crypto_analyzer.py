@@ -5121,15 +5121,22 @@ def main() -> None:
     if args.event_stats:
         if _evmod is None:
             print("event_database modul nem elerheto."); return
-        df = fetch_binance_data(args.event_stats, days=args.backtest_days if hasattr(args, 'backtest_days') else 365,
-                                interval="1d", quiet=True)
+        _ev_days = args.backtest_days if hasattr(args, 'backtest_days') else 365
+        df = fetch_binance_data(args.event_stats, days=_ev_days,
+                                interval=args.interval, quiet=True)
         df = add_all_indicators(df)
         stats = _evmod.build_event_stats(df)
         ev = _evmod.analyze_events(df, args.event_stats, stats)
         price = float(df["close"].iloc[-1])
         tr = (df["high"]-df["low"]).rolling(14).mean().iloc[-1]
         atr_pct = float(tr/price*100) if price > 0 else 0
-        _evmod.print_event_forecast(args.event_stats, ev, price, atr_pct)
+        # Fazis-3 advanced fejlec
+        adv_lines = None
+        if _advmod is not None:
+            regime = _advmod.detect_market_regime(df)
+            adv_lines = _advmod.advanced_header_lines(
+                args.event_stats, regime, args.advisor_mode, atr_pct, 0, None, df)
+        _evmod.print_event_forecast(args.event_stats, ev, price, atr_pct, adv_lines)
         return
 
     if args.build_event_db:
