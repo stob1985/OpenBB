@@ -37,6 +37,16 @@ import requests
 from colorama import Fore, Style, init as colorama_init
 from scipy.signal import argrelextrema
 
+# Opcionalis modulok (liquidation map + event database)
+try:
+    import liquidation_map as _liqmod
+except Exception:
+    _liqmod = None
+try:
+    import event_database as _evmod
+except Exception:
+    _evmod = None
+
 colorama_init(autoreset=True)
 
 BINANCE_BASE_URL = "https://data-api.binance.vision/api/v3"
@@ -1830,7 +1840,9 @@ def _build_detailed_risk(df, close, atr, vol_24h, rsi, mtf_result,
 
 def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
                   binance_extra: dict | None = None,
-                  mtf_result: dict | None = None) -> dict:
+                  mtf_result: dict | None = None,
+                  with_liq_map: bool = False,
+                  with_events: bool = False) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
     close = last["close"]
@@ -2041,6 +2053,31 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         for a in alerts:
             print(f"  {Y}>>{D} {a}")
 
+    # ---- LIQUIDATION MAP ----
+    liq_edge = 0
+    if with_liq_map and _liqmod is not None:
+        try:
+            lm = _liqmod.analyze_liquidation_map(symbol, close, atr)
+            print(f"\n{M}", end="")
+            _liqmod.print_liquidation_map(symbol, lm)
+            print(D, end="")
+            liq_edge = lm["edge_score"] if lm["edge"] == ("LONG" if score >= 50 else "SHORT") else 0
+        except Exception:
+            pass
+
+    # ---- EVENT FORECAST ----
+    ev_edge = 0
+    if with_events and _evmod is not None:
+        try:
+            stats = _evmod.load_event_stats(symbol)
+            evr = _evmod.analyze_events(df, symbol, stats)
+            print(f"\n{M}", end="")
+            _evmod.print_event_forecast(symbol, evr, close, pos["volatility_pct"])
+            print(D, end="")
+            ev_edge = evr["edge_score"] if evr["edge"] == ("LONG" if score >= 50 else "SHORT") else 0
+        except Exception:
+            pass
+
     print(f"\n{B}{'=' * W}{D}")
 
     return {
@@ -2049,6 +2086,7 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
         "score": score, "raw_score": raw_score, "penalty": penalty,
         "rec": rec, "alerts": len(alerts),
         "pump_warn": pump_warn,
+        "liq_edge": liq_edge, "ev_edge": ev_edge,
     }
 
 
@@ -2057,7 +2095,8 @@ def print_summary(df: pd.DataFrame, symbol: str, sr_levels: list,
 # ============================================================================
 def run_scanner(symbols: list, days: int, source: str, provider: str,
                 interval: str, quote: str,
-                detail_threshold: float = 0, use_mtf: bool = False) -> None:
+                detail_threshold: float = 0, use_mtf: bool = False,
+                with_liq_map: bool = False, with_events: bool = False) -> None:
     """detail_threshold: csak ez feletti score-nal ad reszletes elemzest + chartot."""
     results = []
     for sym in symbols:
@@ -2104,7 +2143,8 @@ def run_scanner(symbols: list, days: int, source: str, provider: str,
                     "pump_warn": pen >= 20, "mtf": mtf_str,
                 })
                 continue
-            info = print_summary(df, sym, sr, binance_extra, mtf_result=mtf)
+            info = print_summary(df, sym, sr, binance_extra, mtf_result=mtf,
+                                  with_liq_map=with_liq_map, with_events=with_events)
             if mtf:
                 info["mtf"] = f"{mtf['bull_count']}/4"
             plot_chart(df, sym, sr)
@@ -4727,7 +4767,60 @@ def main() -> None:
                         help="Multi-timeframe elemzes (1h, 4h, 1d, 1w)")
     parser.add_argument("--mtf-min", type=int, default=3,
                         help="Minimum egyezo timeframe szam (alapert: 3)")
+    # Liquidation Map + Event Database
+    parser.add_argument("--liq-map", default=None,
+                        help="Likvidacios terkep egy coinhoz (pl. BTCUSDT)")
+    parser.add_argument("--event-stats", default=None,
+                        help="Statisztikai event elemzes egy coinhoz")
+    parser.add_argument("--build-event-db", action="store_true",
+                        help="Event adatbazis epitese (--symbols listara)")
+    parser.add_argument("--with-liq-map", action="store_true",
+                        help="Likvidacios terkep beepitese az elemzesbe")
+    parser.add_argument("--with-events", action="store_true",
+                        help="Event statisztika beepitese az elemzesbe")
     args = parser.parse_args()
+
+    # --- Liquidation Map / Event standalone parancsok ---
+    if args.liq_map:
+        if _liqmod is None:
+            print("liquidation_map modul nem elerheto."); return
+        df = fetch_binance_data(args.liq_map, days=30, interval="1d", quiet=True)
+        df = add_all_indicators(df)
+        price = float(df["close"].iloc[-1])
+        atr = _calc_atr(df) if len(df) >= 15 else 0
+        lm = _liqmod.analyze_liquidation_map(args.liq_map, price, atr)
+        _liqmod.print_liquidation_map(args.liq_map, lm)
+        return
+
+    if args.event_stats:
+        if _evmod is None:
+            print("event_database modul nem elerheto."); return
+        df = fetch_binance_data(args.event_stats, days=args.backtest_days if hasattr(args, 'backtest_days') else 365,
+                                interval="1d", quiet=True)
+        df = add_all_indicators(df)
+        stats = _evmod.build_event_stats(df)
+        ev = _evmod.analyze_events(df, args.event_stats, stats)
+        price = float(df["close"].iloc[-1])
+        tr = (df["high"]-df["low"]).rolling(14).mean().iloc[-1]
+        atr_pct = float(tr/price*100) if price > 0 else 0
+        _evmod.print_event_forecast(args.event_stats, ev, price, atr_pct)
+        return
+
+    if args.build_event_db:
+        if _evmod is None:
+            print("event_database modul nem elerheto."); return
+        syms = [s.strip() for s in args.symbols.split(",")] if args.symbols else ["BTCUSDT"]
+        for sym in syms:
+            try:
+                print(f"  Event DB epites: {sym}...", flush=True)
+                df = fetch_binance_data(sym, days=730, interval="1d", quiet=True)
+                df = add_all_indicators(df)
+                stats = _evmod.build_event_stats(df)
+                _evmod.save_event_stats(sym, stats)
+                print(f"    {len(stats)} event mentve.")
+            except Exception as e:
+                print(f"    HIBA: {e}")
+        return
 
     source = args.source
     if args.scan_binance or args.scan_shorts or args.scan_all or args.scan_golden or args.scan_smart:
@@ -4796,7 +4889,9 @@ def main() -> None:
     run_scanner(coin_list, args.days, source, args.provider,
                 args.interval, args.quote,
                 detail_threshold=args.detail_threshold,
-                use_mtf=args.mtf)
+                use_mtf=args.mtf,
+                with_liq_map=args.with_liq_map,
+                with_events=args.with_events)
 
 
 if __name__ == "__main__":
