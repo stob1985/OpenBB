@@ -26,6 +26,7 @@ Hasznalat:
 """
 
 import argparse
+import os
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
@@ -5010,6 +5011,376 @@ def run_smart_scan(days: int, interval: str, quote: str, min_volume: float,
 
 
 # ============================================================================
+# FULL REVIEW — profi napi dashboard (TradingView P2+VDB stilus)
+# ============================================================================
+import re as _re
+
+
+def _strip_ansi(s: str) -> str:
+    return _re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def run_full_review(symbol: str, days: int = 365, advisor_mode: str = "NORMAL") -> None:
+    """Teljes koru napi felulvizsgalat egy coinra — 3 panel + akcio terv.
+
+    Elo Binance spot + OKX/Binance futures adat, event database, 190-pontos motor.
+    Mentes: results/full_review_SYMBOL_YYYY-MM-DD_HHMM.txt
+    """
+    from datetime import datetime as _dt
+    G = Fore.GREEN + Style.BRIGHT
+    R = Fore.RED + Style.BRIGHT
+    Y = Fore.YELLOW + Style.BRIGHT
+    B = Fore.CYAN + Style.BRIGHT
+    M = Fore.MAGENTA + Style.BRIGHT
+    W = Fore.WHITE + Style.BRIGHT
+    D = Style.RESET_ALL
+
+    buf: list[str] = []
+
+    def P(colored: str = "", plain: str | None = None) -> None:
+        print(colored)
+        buf.append(plain if plain is not None else _strip_ansi(colored))
+
+    def col_dir(val, pos_txt, neg_txt=None):
+        """Szin irany szerint."""
+        return G if val == (pos_txt) else (R if (neg_txt and val == neg_txt) else Y)
+
+    def _pf(v):
+        """Tiszta ar formatum (nincs tudomanyos jeloles)."""
+        if v >= 1000:
+            return f"${v:,.0f}"
+        if v >= 1:
+            return f"${v:,.2f}"
+        if v >= 0.01:
+            return f"${v:.4f}"
+        return f"${v:.6f}"
+
+    sym = symbol.upper().replace("-", "")
+
+    # ---- ADATLEKERES ----
+    try:
+        df = fetch_binance_data(sym, days=days, interval="1d", quiet=True)
+        df = add_all_indicators(df)
+    except Exception as e:
+        print(f"{R}HIBA: nem sikerult lekerni a(z) {sym} adatait: {e}{D}")
+        return
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    prev = float(df["close"].iloc[-2])
+    chg = (price / prev - 1) * 100
+    atr = _calc_atr(df) if len(df) >= 15 else price * 0.02
+    atr_pct = atr / price * 100 if price else 0
+    rsi = float(last.get("rsi", 50))
+
+    # Liquidation map
+    try:
+        lm = _liqmod.analyze_liquidation_map(sym, price, atr, df=df) if _liqmod else None
+    except Exception:
+        lm = None
+
+    # Event database (load vagy build)
+    ev = stats = None
+    if _evmod is not None:
+        try:
+            stats = _evmod.load_event_stats(sym)
+            if stats is None:
+                P(f"{Y}  Event DB nem talalhato — epites most ({sym})...{D}")
+                stats = _evmod.build_event_stats(df)
+                _evmod.save_event_stats(sym, stats)
+            ev = _evmod.analyze_events(df, sym, stats)
+        except Exception:
+            ev = stats = None
+
+    # Advanced + golden + combined
+    regime = _advmod.detect_market_regime(df) if _advmod else "NORMAL"
+    corr = None
+    if _advmod is not None:
+        try:
+            if ev:
+                _advmod.record_prediction(sym, ev.get("up_pct", 50), price)
+            corr = _advmod.resolve_and_correlate(sym, df)
+        except Exception:
+            corr = None
+    gs = detect_golden_setup(df)
+    try:
+        mtf = calc_mtf(sym)
+    except Exception:
+        mtf = None
+    cd = combined_decision(gs, lm, ev, atr_pct, advisor_mode=advisor_mode,
+                           regime=regime, corr=corr)
+
+    # ================== FEJLEC ==================
+    now = _dt.now()
+    chgc = G if chg >= 0 else R
+    ftimer = lm.get("funding_timer", "N/A") if lm else "N/A"
+    P(f"\n{B}{'═' * 71}{D}")
+    P(f"{W}🪙 {sym} Perpetual Contract — FULL REVIEW{D}")
+    P(f"{B}{'═' * 71}{D}")
+    P(f"  Ar: {W}{_pf(price)}{D} | {chgc}{chg:+.2f}%{D} | TF: 1D | Forras: Binance/OKX")
+    P(f"  Datum: {now:%Y-%m-%d %H:%M} | Next Funding: {ftimer}")
+
+    # ================== PANEL 1 — LIQUIDATION MAP ==================
+    P(f"\n{B}┌{'─' * 69}┐{D}")
+    P(f"{B}│{D} {W}PANEL 1 — LIQUIDATION MAP (Attractimap){D}{' ' * 30}{B}│{D}")
+    P(f"{B}└{'─' * 69}┘{D}")
+    if not lm or not lm.get("available"):
+        P(f"  {Y}N/A — nincs futures adat{D}")
+    else:
+        liqs = lm["liqs"]
+        # Tokeattetel aktiv szintek (hany szint van a 15% savban tier-enkent)
+        tier_active = {}
+        for lev in [10, 25, 50, 100]:
+            cnt = 0
+            if abs(liqs["short_liqs"][lev] - price) / price <= 0.15:
+                cnt += 1
+            if abs(liqs["long_liqs"][lev] - price) / price <= 0.15:
+                cnt += 1
+            tier_active[lev] = cnt
+        P(f"  Tokeattetel aktiv: 10x: {tier_active[10]} | 25x: {tier_active[25]} | "
+          f"50x: {tier_active[50]} | 100x: {tier_active[100]}")
+        htf_s = "ON" if lm.get("htf_enabled") else "OFF"
+        P(f"  Active: {lm.get('active_count', 0)} | Long/Short: "
+          f"{lm.get('active_long', 0)}/{lm.get('active_short', 0)} | HTF Levels: {htf_s}")
+        nm = f"{lm['magnet_dist_atr']:.1f} ATR" if lm.get("magnet_dist_atr") else "N/A"
+        P(f"  Nearest Cluster: {nm} | Cluster Density: {lm.get('density', 'N/A')}")
+        imb = lm.get("liq_imbalance", "= NEUTRAL")
+        imbc = G if "BULL" in imb else (R if "BEAR" in imb else Y)
+        P(f"  Liq Imbalance: {imbc}{imb}{D}")
+        cvd = lm.get("cvd_bias") or "N/A"
+        cvdc = col_dir(cvd, "LONG", "SHORT")
+        P(f"  CVD Bias: {cvdc}{cvd}{D}")
+        if lm["bounce"]["rate"] is not None:
+            P(f"  Bounce Rate: {lm['bounce']['rate']:.1f}% ({lm['bounce']['events']} events)")
+        rgc = Y if lm.get("proxy_mode") else G
+        P(f"  Data/Regime: {rgc}{'PROXY' if lm.get('proxy_mode') else 'LIVE'}|{lm.get('regime','NORMAL')}{D}"
+          f" | Forras: {lm.get('source','?')}")
+        P(f"  Zones: ATR×{lm.get('zone_width', 0.3)} | Piv: {lm.get('piv_count', 5)}")
+
+        hl_levels = [h["level"] for h in lm.get("highlights", [])]
+
+        def _star(p):
+            return " ⭐" if any(abs(h - p) / p < 0.005 for h in hl_levels) else ""
+
+        # Felfele = short liq (ar emelkedeskor)
+        P(f"\n  {R}LIKVIDACIOS KLASZTEREK (felfele — short likvidaciok):{D}")
+        for lev in (100, 50, 25, 10):
+            p = liqs["short_liqs"][lev]
+            n = liqs["short_notional"][lev]
+            da = abs(p - price) / atr if atr else 0
+            P(f"    {_pf(p)} — {lev:>3}x (${n/1e6:.1f}M, {da:.1f} ATR){_star(p)}")
+        P(f"\n  {W}[ AKTUALIS AR: {_pf(price)} ]{D}")
+        P(f"\n  {G}LIKVIDACIOS KLASZTEREK (lefele — long likvidaciok):{D}")
+        for lev in (10, 25, 50, 100):
+            p = liqs["long_liqs"][lev]
+            n = liqs["long_notional"][lev]
+            da = abs(p - price) / atr if atr else 0
+            P(f"    {_pf(p)} — {lev:>3}x (${n/1e6:.1f}M, {da:.1f} ATR){_star(p)}")
+
+        # Sweep log
+        sweep = lm.get("sweep")
+        if sweep and sweep.get("entries"):
+            P(f"\n  {M}SWEEP LOG (klaszter status):{D}")
+            shown = [e for e in sweep["entries"] if e["status"] in ("PENDING", "ACTIVE")][:6]
+            for e in shown:
+                arrow = "▼" if e["dir"] == "LONG" else "▲"
+                stc = Y if e["status"] == "PENDING" else (G if e["status"] == "ACTIVE" else D)
+                P(f"    {arrow} {_pf(e['level'])} {e['dir']:<5} — {e['lev']}x — {stc}{e['status']}{D}")
+            P(f"    (COMPLETED: {sweep.get('completed',0)} | FAILED: {sweep.get('failed',0)})")
+
+        # Attractor
+        attrs = lm.get("attractors", [])
+        if attrs:
+            P(f"\n  {M}🧲 ATTRACTOR DISTANCE:{D}")
+            for i, a in enumerate(attrs):
+                lbl = ["1st", "2nd", "3rd"][i] if i < 3 else f"{i+1}th"
+                P(f"    {lbl}: {_pf(a['level'])} ({a['dist_atr']} ATR {a['dir']}, {a['size']})")
+
+    # ================== PANEL 2 — EVENT DATABASE ==================
+    P(f"\n{B}┌{'─' * 69}┐{D}")
+    P(f"{B}│{D} {W}PANEL 2 — STATISTICAL EVENT DATABASE (P2+VDB){D}{' ' * 23}{B}│{D}")
+    P(f"{B}└{'─' * 69}┘{D}")
+    if not ev:
+        P(f"  {Y}N/A — event database nem elerheto{D}")
+    else:
+        rgc = G if regime == "BULL" else (R if regime == "BEAR" else Y)
+        mtf_sig = mtf["signal"] if mtf else "N/A"
+        mtfc = G if "LONG" in mtf_sig else (R if "SHORT" in mtf_sig else Y)
+        P(f"  ADV: {advisor_mode} | Regime: {rgc}{regime}{D} | MTF: {mtfc}{mtf_sig}{D}")
+        if _advmod:
+            sess = _advmod.get_session()
+            ml, mp = _advmod.get_moon_phase()
+            P(f"  Session: {sess} | Moon: {mp:.1f}% {ml}")
+            P(f"  Expected Vol: ±{_advmod.volatility_forecast(atr_pct, 5):.2f}% / 5d")
+            sett = _advmod.regime_settings(regime)
+            P(f"  Auto-Opt: {regime} | RSI OB:{sett['rsi_ob']}/OS:{sett['rsi_os']} | "
+              f"pivLB={sett['pivot_lookback']} | H={sett['hold_period']}d")
+            pf = _advmod.multi_horizon_pf(df)
+            P(f"  {_advmod.pf_line(pf)} | LB={len(df)}d")
+
+        # ACTIVE EVENTS tabla
+        P(f"\n  {W}ACTIVE EVENTS:{D}")
+        hdr = (f"  {'EVENT':<16}{'DN%':>6}{'UP%':>6}{'WR':>6}{'n':>6}"
+               f"{'EXPECT':>8}{'PF':>6}{'LAST5':>8}{'QUAL':>5}  {'BIAS':<6} {'EDGE'}")
+        P(f"{B}{hdr}{D}")
+        P(f"  {'-' * 78}")
+        for st in ev.get("active_stats", []):
+            full = (stats or {}).get(st["event"], {})
+            wr = st["WR_5d"]
+            up = wr
+            dn = 100 - wr
+            expect = full.get("AVG_3d", st.get("AVG_5d", 0))
+            pf5 = full.get("PF_5d", 0)
+            last5 = full.get("last5_avg", 0)
+            biasc = col_dir(st.get("bias"), "UP", "DOWN")
+            edgec = col_dir(st.get("edge"), "UP", "DOWN")
+            row = (f"  {st.get('label', st['event']):<16}{dn:>5.1f}%{up:>5.1f}%{wr:>5.1f}%"
+                   f"{st['n']:>6}{expect:>+7.2f}%{pf5:>6.2f}{last5:>+7.2f}%"
+                   f"{st['quality']:>5}  {biasc}{str(st.get('bias','—')):<6}{D} {edgec}{st.get('edge','?')}{D}")
+            P(row)
+
+        # Composite
+        up_b, dn_b = ev.get("n_up_bias", 0), ev.get("n_dn_bias", 0)
+        bc = G if ev["bias"] == "UP" else (R if ev["bias"] == "DOWN" else Y)
+        P(f"\n  {W}◆ COMPOSITE{D} ({ev['n_active']} active · {up_b}↑ / {dn_b}↓ after regime)")
+        P(f"    UP: {ev['up_pct']:.1f}% | DN: {ev['dn_pct']:.1f}% | "
+          f"Bias: {bc}{ev['bias']} | {ev['strength']}{D} | Q: {ev['avg_quality']}")
+
+        # Forecast
+        move = price * atr_pct / 100 * 2.2
+        P(f"\n  {W}📈 FORECAST 5-day @ {ev.get('conf_pct', 60)}%:{D}")
+        P(f"    {G}▲ Up:   {_pf(price + move)}{D}")
+        P(f"    {R}▼ Down: {_pf(price - move)}{D}")
+
+        # Adaptive weights + correlation
+        if _advmod:
+            P(f"\n  Adaptive Weights:")
+            for ln in _advmod.weights_line().split("\n"):
+                P(f"  {ln.strip()}")
+        if corr and corr.get("corr") is not None:
+            cc = G if corr["corr"] > 25 else (Y if corr["corr"] >= 0 else R)
+            P(f"\n  Correlation Tracking: {cc}Corr: {corr['corr']:+d}%{D} | Q: {corr['q']} ({corr['label']})")
+
+        # VDB historical
+        if stats:
+            P(f"\n  {W}VIRTUAL EVENT DATABASE — Live Return & Drawdown History:{D}")
+            vh = (f"  {'EVENT':<16}{'N':>5}{'WR1d':>6}{'WR3d':>6}{'WR5d':>6}"
+                  f"{'AVG1d':>7}{'AVG5d':>7}{'MDD':>7}{'BEST3':>7}{'WRST3':>7}")
+            P(f"{B}{vh}{D}")
+            P(f"  {'-' * 80}")
+            evmod = _evmod
+            label_of = (lambda k: evmod.EVENT_LABELS.get(k, k)) if hasattr(evmod, "EVENT_LABELS") else (lambda k: k)
+            for evname, s in sorted(stats.items(), key=lambda x: -x[1].get("n", 0)):
+                P(f"  {label_of(evname):<16}{s.get('n',0):>5}"
+                  f"{s.get('WR_1d',0):>5.0f}%{s.get('WR_3d',0):>5.0f}%{s.get('WR_5d',0):>5.0f}%"
+                  f"{s.get('AVG_1d',0):>+6.2f}%{s.get('AVG_5d',0):>+6.2f}%"
+                  f"{s.get('MDD_3d',0):>+6.2f}%{s.get('BEST_3d',0):>+6.1f}%{s.get('WORST_3d',0):>+6.1f}%")
+
+    # ================== PANEL 3 — VEGSO DONTES ==================
+    P(f"\n{B}┌{'─' * 69}┐{D}")
+    P(f"{B}│{D} {W}PANEL 3 — VEGSO DONTES (190-pontos motor){D}{' ' * 27}{B}│{D}")
+    P(f"{B}└{'─' * 69}┘{D}")
+    sec_detail = ""
+    if mtf:
+        sec_detail = f"(MTF {mtf['bull_count']}/4 bull, {mtf['bear_count']}/4 bear)"
+    P(f"    Golden Setup:   {cd['base']:>4} / 100   ({gs.get('count',0)}/6 {gs.get('label','')})")
+    P(f"  + Masodlagos:     {cd['secondary']:>+4} /  40   {sec_detail}")
+    P(f"  + Liquidation Map:{cd['liq_pts']:>+4} /  25   ({cd['liq_dir']})")
+    P(f"  + Event Database: {cd['ev_pts']:>+4} /  25   ({cd['ev_dir']})")
+    P(f"  {'─' * 36}")
+    fc = G if cd["final"] >= 150 else (Y if cd["final"] >= 110 else R)
+    P(f"    {fc}FINAL SCORE:    {cd['final']:>4} / 190{D}")
+
+    tier_emoji = {"LEGENDARY": "💎💎💎", "PERFECT": "💎💎", "STRONG": "💎",
+                  "GOOD": "🟢", "MEDIUM": "🟡"}.get(cd["tier"], "🔴")
+    dirn = cd.get("direction") or "—"
+    dc = G if dirn == "LONG" else (R if dirn == "SHORT" else Y)
+    P(f"\n  VERDIKT: {tier_emoji} {fc}{cd['tier']}{D} — {dc}{dirn}{D}")
+    P(f"  => {fc}{cd['decision']}{D}")
+
+    # ---- AKCIO TERV ----
+    if lm and lm.get("available") and dirn in ("LONG", "SHORT"):
+        liqs = lm["liqs"]
+        P(f"\n  {W}🎯 AKCIO TERV:{D}")
+        if dirn == "SHORT":
+            strat = "Inverse Golden Short / Breakout Short"
+            entry = liqs["short_liqs"][50]   # visszapattanas a short liq zonaba
+            stop = liqs["short_liqs"][25]    # kovetkezo short liq felett
+            tps = [(liqs["long_liqs"][25], "25x long liq"),
+                   (liqs["long_liqs"][10], "10x long liq")]
+        else:
+            strat = "Golden Long / Breakout Long"
+            entry = liqs["long_liqs"][50]
+            stop = liqs["long_liqs"][25]
+            tps = [(liqs["short_liqs"][25], "25x short liq"),
+                   (liqs["short_liqs"][10], "10x short liq")]
+        risk = abs(stop - entry)
+        risk_pct = risk / entry * 100 if entry else 0
+        P(f"    Strategia:  {strat}")
+        P(f"    Entry:      {_pf(entry)} (visszateszt zona)")
+        P(f"    Stop:       {_pf(stop)} ({(stop/entry-1)*100:+.1f}%)")
+        for i, (tp, lbl) in enumerate(tps, 1):
+            reward = abs(entry - tp)
+            rr = reward / risk if risk else 0
+            pnl = (entry - tp) / entry * 100 if dirn == "SHORT" else (tp - entry) / entry * 100
+            P(f"    Target {i}:   {_pf(tp)} ({pnl:+.1f}%) — R:R 1:{rr:.1f} [{lbl}]")
+        # Poziciomeret: 1% risk $1000 portfolio
+        if risk_pct > 0:
+            pos_usd = (1000 * 0.01) / (risk_pct / 100)
+            P(f"    Pozicio:    ${pos_usd:,.0f} (1% risk @ $1000, max veszteseg $10)")
+    else:
+        P(f"\n  {Y}🎯 AKCIO TERV: nincs ervenyes belepo (NE LEPJ BE){D}")
+
+    # MELLETTE / ELLENE
+    pros, cons = [], []
+    if lm and lm.get("available"):
+        if lm["edge"] == "LONG":
+            pros.append("Liq Map LONG edge")
+        elif lm["edge"] == "SHORT":
+            pros.append("Liq Map SHORT edge")
+        if lm.get("cvd_bias") in ("LONG", "SHORT"):
+            (pros if lm["cvd_bias"] == dirn else cons).append(f"CVD {lm['cvd_bias']}")
+        if lm.get("proxy_mode"):
+            cons.append("PROXY mod (-10, kevesbe megbizhato)")
+    if gs.get("direction") == dirn and gs.get("count", 0) >= 4:
+        pros.append(f"Golden Setup {gs['count']}/6 {dirn}")
+    if mtf:
+        if "CONFIRMED" in mtf["signal"]:
+            pros.append(mtf["signal"])
+    if ev:
+        if ev["edge"] == ("LONG" if dirn == "LONG" else "SHORT") and ev["edge"] != "NEUTRAL":
+            pros.append(f"Event edge {ev['edge']} (Q{ev['avg_quality']})")
+        elif ev["bias"] == "NEUTRAL":
+            cons.append("Event DB NEUTRAL (nincs statisztikai edge)")
+    if rsi > 70:
+        cons.append(f"RSI {rsi:.0f} tulvett")
+    elif rsi < 30:
+        cons.append(f"RSI {rsi:.0f} tuladott (bounce-veszely)")
+    if regime == "HIGH_VOL":
+        cons.append("HIGH_VOL regime (fel pozicio)")
+    for v in cd.get("vetoes", []):
+        cons.append(v)
+
+    P(f"\n  {G}✅ MELLETTE:{D}")
+    for p in (pros or ["nincs eros pozitiv faktor"]):
+        P(f"    {G}+{D} {p}")
+    P(f"  {R}⚠️ ELLENE:{D}")
+    for c in (cons or ["nincs jelentos kockazat"]):
+        P(f"    {R}-{D} {c}")
+    P(f"{B}{'═' * 71}{D}")
+
+    # ---- MENTES ----
+    try:
+        os.makedirs("results", exist_ok=True)
+        fn = f"results/full_review_{sym}_{now:%Y-%m-%d_%H%M}.txt"
+        with open(fn, "w") as f:
+            f.write("\n".join(buf))
+        print(f"\n{B}Mentve: {Y}{fn}{D}")
+    except Exception as e:
+        print(f"{R}Mentes sikertelen: {e}{D}")
+
+
+# ============================================================================
 # 17. FOPROGRAM
 # ============================================================================
 def main() -> None:
@@ -5076,6 +5447,8 @@ def main() -> None:
     parser.add_argument("--mtf-min", type=int, default=3,
                         help="Minimum egyezo timeframe szam (alapert: 3)")
     # Liquidation Map + Event Database
+    parser.add_argument("--full-review", default=None,
+                        help="Teljes napi dashboard egy coinra (pl. BTCUSDT) — 3 panel + akcio terv")
     parser.add_argument("--liq-map", default=None,
                         help="Likvidacios terkep egy coinhoz (pl. BTCUSDT)")
     parser.add_argument("--htf-levels", action="store_true",
@@ -5102,6 +5475,12 @@ def main() -> None:
                         choices=["CONSERVATIVE", "NORMAL", "AGGRESSIVE"],
                         help="Advisor mod: szigorubb/lazabb belepesi kuszobok (Fazis 3)")
     args = parser.parse_args()
+
+    # --- Full review dashboard ---
+    if args.full_review:
+        _fr_days = args.backtest_days if hasattr(args, "backtest_days") and args.backtest_days else 365
+        run_full_review(args.full_review, days=_fr_days, advisor_mode=args.advisor_mode)
+        return
 
     # --- Liquidation Map / Event standalone parancsok ---
     if args.liq_map:
