@@ -5020,7 +5020,8 @@ def _strip_ansi(s: str) -> str:
     return _re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
-def run_full_review(symbol: str, days: int = 365, advisor_mode: str = "NORMAL") -> None:
+def run_full_review(symbol: str, days: int = 365, advisor_mode: str = "NORMAL",
+                    review_tf: str = "1d") -> None:
     """Teljes koru napi felulvizsgalat egy coinra — 3 panel + akcio terv.
 
     Elo Binance spot + OKX/Binance futures adat, event database, 190-pontos motor.
@@ -5079,16 +5080,25 @@ def run_full_review(symbol: str, days: int = 365, advisor_mode: str = "NORMAL") 
     except Exception:
         lm = None
 
-    # Event database (load vagy build)
+    # Event database (load vagy build). review_tf=4h -> magas confidence VDB.
+    ev_tf = (review_tf or "1d").lower()
+    ev_df = df
+    if ev_tf not in ("1d", "1day", "d"):
+        try:
+            ev_df = fetch_binance_data(sym, days=720, interval=ev_tf, quiet=True)
+            ev_df = add_all_indicators(ev_df)
+        except Exception:
+            ev_df = df
+            ev_tf = "1d"
     ev = stats = None
     if _evmod is not None:
         try:
-            stats = _evmod.load_event_stats(sym)
+            stats = _evmod.load_event_stats(sym, interval=ev_tf)
             if stats is None:
-                P(f"{Y}  Event DB nem talalhato — epites most ({sym})...{D}")
-                stats = _evmod.build_event_stats(df)
-                _evmod.save_event_stats(sym, stats)
-            ev = _evmod.analyze_events(df, sym, stats)
+                P(f"{Y}  Event DB [{ev_tf}] nem talalhato — epites most ({sym})...{D}")
+                stats = _evmod.build_event_stats(ev_df)
+                _evmod.save_event_stats(sym, stats, interval=ev_tf)
+            ev = _evmod.analyze_events(ev_df, sym, stats)
         except Exception:
             ev = stats = None
 
@@ -5216,7 +5226,7 @@ def run_full_review(symbol: str, days: int = 365, advisor_mode: str = "NORMAL") 
             P(f"  Auto-Opt: {regime} | RSI OB:{sett['rsi_ob']}/OS:{sett['rsi_os']} | "
               f"pivLB={sett['pivot_lookback']} | H={sett['hold_period']}d")
             pf = _advmod.multi_horizon_pf(df)
-            P(f"  {_advmod.pf_line(pf)} | LB={len(df)}d")
+            P(f"  {_advmod.pf_line(pf)} | LB={len(df)}d | VDB-TF: {ev_tf} ({len(ev_df)} gyertya)")
 
         # ACTIVE EVENTS tabla
         P(f"\n  {W}ACTIVE EVENTS:{D}")
@@ -5459,8 +5469,12 @@ def main() -> None:
     parser.add_argument("--piv-count", type=int, default=5,
                         choices=[5, 10, 15],
                         help="Pivot szintek szama a likvidacios terkephez")
-    parser.add_argument("--tf", default=None, choices=["1H", "2H", "4H", "1D"],
-                        help="Multi-timeframe liq map: kulon TF (1H/2H/4H/1D)")
+    parser.add_argument("--tf", default=None,
+                        choices=["1H", "2H", "4H", "1D", "1h", "2h", "4h", "1d"],
+                        help="Timeframe: liq map multi-TF VAGY event DB build TF (1h/2h/4h/1d)")
+    parser.add_argument("--full-review-tf", default="1d",
+                        choices=["1H", "2H", "4H", "1D", "1h", "2h", "4h", "1d"],
+                        help="Full review event DB timeframe (4h = magas confidence VDB)")
     parser.add_argument("--event-stats", default=None,
                         help="Statisztikai event elemzes egy coinhoz")
     parser.add_argument("--build-event-db", action="store_true",
@@ -5479,7 +5493,8 @@ def main() -> None:
     # --- Full review dashboard ---
     if args.full_review:
         _fr_days = args.backtest_days if hasattr(args, "backtest_days") and args.backtest_days else 365
-        run_full_review(args.full_review, days=_fr_days, advisor_mode=args.advisor_mode)
+        run_full_review(args.full_review, days=_fr_days, advisor_mode=args.advisor_mode,
+                        review_tf=args.full_review_tf)
         return
 
     # --- Liquidation Map / Event standalone parancsok ---
@@ -5522,14 +5537,18 @@ def main() -> None:
         if _evmod is None:
             print("event_database modul nem elerheto."); return
         syms = [s.strip() for s in args.symbols.split(",")] if args.symbols else ["BTCUSDT"]
+        # Event DB timeframe: --tf ha megadva, kulonben 1d. Sub-daily -> tobb nap.
+        db_tf = (args.tf or "1d").lower()
+        db_days = 720 if db_tf not in ("1d", "1day", "d") else 730
         for sym in syms:
             try:
-                print(f"  Event DB epites: {sym}...", flush=True)
-                df = fetch_binance_data(sym, days=730, interval="1d", quiet=True)
+                print(f"  Event DB epites: {sym} [{db_tf}]...", flush=True)
+                df = fetch_binance_data(sym, days=db_days, interval=db_tf, quiet=True)
                 df = add_all_indicators(df)
                 stats = _evmod.build_event_stats(df)
-                _evmod.save_event_stats(sym, stats)
-                print(f"    {len(stats)} event mentve.")
+                _evmod.save_event_stats(sym, stats, interval=db_tf)
+                hi_q = sum(1 for s in stats.values() if s.get("quality", 0) >= 60)
+                print(f"    {len(stats)} event mentve ({len(df)} gyertya, {hi_q} db Q>=60).")
             except Exception as e:
                 print(f"    HIBA: {e}")
         return

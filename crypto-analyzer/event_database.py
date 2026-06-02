@@ -329,14 +329,21 @@ def build_event_stats(df: pd.DataFrame) -> dict:
     return stats
 
 
-def save_event_stats(symbol: str, stats: dict) -> None:
+def _events_path(symbol: str, interval: str = "1d") -> str:
+    """Event DB fajl utvonal. 1d -> SYMBOL_events.json; mas TF -> SYMBOL_4h_events.json."""
+    iv = (interval or "1d").lower()
+    suffix = "" if iv in ("1d", "1day", "d") else f"_{iv}"
+    return f"{EVENT_DB_DIR}/{symbol}{suffix}_events.json"
+
+
+def save_event_stats(symbol: str, stats: dict, interval: str = "1d") -> None:
     os.makedirs(EVENT_DB_DIR, exist_ok=True)
-    with open(f"{EVENT_DB_DIR}/{symbol}_events.json", "w") as f:
+    with open(_events_path(symbol, interval), "w") as f:
         json.dump(stats, f, indent=2)
 
 
-def load_event_stats(symbol: str) -> dict | None:
-    path = f"{EVENT_DB_DIR}/{symbol}_events.json"
+def load_event_stats(symbol: str, interval: str = "1d") -> dict | None:
+    path = _events_path(symbol, interval)
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
